@@ -240,3 +240,98 @@ fn drawio_detected_and_roundtrips() {
     assert!(s.contains(r#"value="Begin""#));
     assert!(s.contains(r#"id="2""#));
 }
+
+// --- docx (OOXML container) -------------------------------------------------
+
+use std::io::{Read, Write};
+
+const DOCX_DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Original heading</w:t></w:r></w:p><w:p><w:r><w:t>Body text.</w:t></w:r></w:p></w:body></w:document>"#;
+
+const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+
+const RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+
+/// Build a minimal but valid docx (three parts) in memory.
+fn build_docx(document_xml: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in [
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", RELS),
+            ("word/document.xml", document_xml),
+        ] {
+            zw.start_file(name, opts).unwrap();
+            zw.write_all(body.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+    out
+}
+
+fn read_docx_part(container: &[u8], name: &str) -> String {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(container)).unwrap();
+    let mut f = zip.by_name(name).unwrap();
+    let mut s = String::new();
+    f.read_to_string(&mut s).unwrap();
+    s
+}
+
+#[test]
+fn docx_detected_and_lossless() {
+    let docx = build_docx(DOCX_DOCUMENT);
+    let out = extract("report.docx", &docx).unwrap();
+    assert_eq!(out.envelope.source.r#type, "docx");
+    assert!(out.envelope.writable);
+    // Empty patch reproduces the container exactly.
+    let same = reconstruct(
+        &out.envelope,
+        out.idmap.as_ref().unwrap(),
+        &docx,
+        &Patch { patch: vec![] },
+    )
+    .unwrap();
+    assert_eq!(same, docx, "no-op docx patch must be byte-identical");
+}
+
+#[test]
+fn docx_edit_is_surgical_and_repackages() {
+    let docx = build_docx(DOCX_DOCUMENT);
+    let out = extract("report.docx", &docx).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+
+    // Edit the w:t run carrying the heading text.
+    let id = id_with_text(&out.envelope, "Original heading");
+    let guard = idmap.get(&id).unwrap().hash.clone();
+    let patch = Patch {
+        patch: vec![
+            Op::Test {
+                path: format!("/structure/{id}"),
+                hash: guard,
+            },
+            Op::Replace {
+                path: format!("/structure/{id}/text"),
+                value: "Revised heading".to_string(),
+            },
+        ],
+    };
+    let new_docx = reconstruct(&out.envelope, idmap, &docx, &patch).unwrap();
+
+    // The edited part changed as intended...
+    let doc = read_docx_part(&new_docx, "word/document.xml");
+    assert!(doc.contains("<w:t>Revised heading</w:t>"));
+    assert!(doc.contains("<w:t>Body text.</w:t>"));
+    // ...and the untouched parts are preserved verbatim.
+    assert_eq!(
+        read_docx_part(&new_docx, "[Content_Types].xml"),
+        CONTENT_TYPES
+    );
+    assert_eq!(read_docx_part(&new_docx, "_rels/.rels"), RELS);
+    // Re-extracting the rebuilt docx still verifies (spans are consistent).
+    extract("report.docx", &new_docx).unwrap();
+}

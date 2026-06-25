@@ -47,7 +47,11 @@ pub fn extract(path: &str, bytes: &[u8]) -> Result<ExtractOutput> {
         let map = idmap
             .as_ref()
             .context("lossless handler produced no id-map")?;
-        verify_on_extract(bytes, map)
+        if map.for_hash != hash {
+            bail!("id-map is bound to a different original");
+        }
+        handler
+            .verify(bytes, map)
             .context("verify-on-extract failed: handler is not byte-faithful for this input")?;
     }
 
@@ -67,45 +71,6 @@ pub fn extract(path: &str, bytes: &[u8]) -> Result<ExtractOutput> {
         structure,
     };
     Ok(ExtractOutput { envelope, idmap })
-}
-
-/// Confirm the id-map is self-consistent against the original bytes: each
-/// element span lies in bounds, starts with `<`, names the recorded tag, and
-/// its bytes hash to the stored guard value. Catches off-by-one span bugs
-/// before any edit relies on them.
-fn verify_on_extract(bytes: &[u8], map: &IdMap) -> Result<()> {
-    if map.for_hash != sha256_hex(bytes) {
-        bail!("id-map is bound to a different original");
-    }
-    for (id, loc) in &map.map {
-        let el = loc.element;
-        if el.start >= el.end || el.end > bytes.len() {
-            bail!("node `{id}`: span out of bounds");
-        }
-        let slice = &bytes[el.start..el.end];
-        if slice.first() != Some(&b'<') {
-            bail!("node `{id}`: span does not start at an element");
-        }
-        // tag name follows '<' (skip a leading '/' just in case)
-        let after = &slice[1..];
-        if !after.starts_with(loc.tag.as_bytes()) {
-            bail!("node `{id}`: span tag mismatch (expected `{}`)", loc.tag);
-        }
-        if sha256_hex(slice) != loc.hash {
-            bail!("node `{id}`: hash mismatch");
-        }
-        if let Some(inner) = loc.inner {
-            if inner.start < el.start || inner.end > el.end || inner.start > inner.end {
-                bail!("node `{id}`: inner span outside element");
-            }
-        }
-        for (name, span) in &loc.attrs {
-            if span.start < el.start || span.end > el.end || span.start > span.end {
-                bail!("node `{id}`: attr `{name}` span outside element");
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Apply a patch to the original and return the reconstructed bytes.
@@ -136,8 +101,9 @@ pub fn reconstruct(
     if idmap.for_hash != envelope.source.hash {
         bail!("sidecar id-map does not match this original (hash mismatch)");
     }
-    let out = patch::apply(original, idmap, patch)?;
-    Ok(out)
+    let handler = handlers::for_type(&envelope.source.r#type)
+        .with_context(|| format!("no handler for type `{}`", envelope.source.r#type))?;
+    handler.reconstruct(original, idmap, patch)
 }
 
 fn file_name(path: &str) -> &str {

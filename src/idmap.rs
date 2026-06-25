@@ -55,6 +55,42 @@ impl IdMap {
     }
 }
 
+/// Confirm an id-map is self-consistent against the byte stream its spans
+/// index into: each element span is in bounds, starts at `<`, names the
+/// recorded tag, and hashes to the stored guard. Catches off-by-one span bugs
+/// before any edit relies on them. (Does not check `for_hash`, which binds to
+/// the *container* and is verified separately.)
+pub fn verify_spans(stream: &[u8], map: &IdMap) -> anyhow::Result<()> {
+    use anyhow::bail;
+    for (id, loc) in &map.map {
+        let el = loc.element;
+        if el.start >= el.end || el.end > stream.len() {
+            bail!("node `{id}`: span out of bounds");
+        }
+        let slice = &stream[el.start..el.end];
+        if slice.first() != Some(&b'<') {
+            bail!("node `{id}`: span does not start at an element");
+        }
+        if !slice[1..].starts_with(loc.tag.as_bytes()) {
+            bail!("node `{id}`: span tag mismatch (expected `{}`)", loc.tag);
+        }
+        if sha256_hex(slice) != loc.hash {
+            bail!("node `{id}`: hash mismatch");
+        }
+        if let Some(inner) = loc.inner {
+            if inner.start < el.start || inner.end > el.end || inner.start > inner.end {
+                bail!("node `{id}`: inner span outside element");
+            }
+        }
+        for (name, span) in &loc.attrs {
+            if span.start < el.start || span.end > el.end || span.start > span.end {
+                bail!("node `{id}`: attr `{name}` span outside element");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `sha256:<hex>` of arbitrary bytes, in the canonical prefixed form.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();

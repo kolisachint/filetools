@@ -25,9 +25,24 @@ Working vertical slice:
 | Verify-on-extract (span/hash self-check) | ✅ |
 | Source-hash drift detection on reconstruct | ✅ |
 | Read-only fallback for unknown binary | ✅ |
-| OOXML (docx/xlsx/pptx) | ⏳ next — builds on the XML core |
+| docx (zip container, edits `word/document.xml`) | ✅ |
+| xlsx / pptx (multi-part containers) | ⏳ next — shares the container plumbing |
 | PDF (in-place content patching) | ⏳ planned |
 | drawio compressed `<diagram>` inflate | ⏳ planned |
+
+### OOXML / docx
+
+A docx is a zip of XML parts. The handler pulls `word/document.xml`, runs the
+lossless XML core on it, and on reconstruct repackages the zip with that one
+part replaced — **every other entry is copied through with its original
+compressed bytes untouched**, so nothing outside the edited part changes. A
+no-op patch returns the container byte-identical.
+
+Editable nodes are the `w:t` text runs (docx splits text across runs). A richer
+layer that merges runs into paragraph-level text — while preserving untouched
+runs per the inline-text decision — is future work. xlsx (`xl/sharedStrings.xml`
+plus per-sheet parts) and pptx (per-slide parts) need multi-part addressing and
+reuse this same container layer.
 
 ## Usage
 
