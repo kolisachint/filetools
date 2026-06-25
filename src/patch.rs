@@ -148,7 +148,12 @@ fn xml_escape_text(s: &str) -> String {
 }
 
 fn xml_escape_attr(s: &str) -> String {
-    xml_escape_text(s).replace('"', "&quot;")
+    // Escape both quote styles: we don't track whether the source attribute
+    // was single- or double-quoted, so escaping both keeps the result valid
+    // either way.
+    xml_escape_text(s)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Apply a patch to the original bytes, returning the new bytes.
@@ -285,7 +290,6 @@ fn run_replace(
         starts.push(acc);
         acc += o.len();
     }
-    let total = acc;
     let old_raw: Vec<u8> = olds.concat();
     let new_raw = xml_escape_text(value).into_bytes();
 
@@ -318,7 +322,6 @@ fn run_replace(
             });
         }
     }
-    let _ = total;
     Ok(edits)
 }
 

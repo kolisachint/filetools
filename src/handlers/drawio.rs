@@ -181,7 +181,7 @@ fn diagrams(outer: &[u8]) -> Vec<Diagram> {
                 continue;
             }
         }
-        let Some(open_end) = find_byte(outer, b'>', after) else {
+        let Some(open_end) = find_tag_end(outer, after) else {
             break;
         };
         if outer.get(open_end.wrapping_sub(1)) == Some(&b'/') {
@@ -300,11 +300,22 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
-fn find_byte(hay: &[u8], b: u8, from: usize) -> Option<usize> {
-    hay.iter()
-        .skip(from)
-        .position(|&x| x == b)
-        .map(|p| p + from)
+/// Find the `>` that closes a start tag, skipping any `>` inside a quoted
+/// attribute value (e.g. `name="a>b"`).
+fn find_tag_end(hay: &[u8], from: usize) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (off, &c) in hay.iter().enumerate().skip(from) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'>' => return Some(off),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 fn looks_xml(content: &[u8]) -> bool {

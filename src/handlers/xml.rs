@@ -155,7 +155,7 @@ pub fn extract(bytes: &[u8], for_hash: &str, part: &str) -> anyhow::Result<Extra
 /// stable structural-path id to a new child. Root-level elements seed their
 /// path with `root_path` (the part name) so ids are unique across parts.
 fn parent_path_and_counts<'a>(
-    stack: &'a mut Vec<Frame>,
+    stack: &'a mut [Frame],
     root_counts: &'a mut HashMap<String, u32>,
     root_path: &str,
 ) -> (String, &'a mut HashMap<String, u32>) {

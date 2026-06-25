@@ -142,6 +142,27 @@ fn replace_attribute_value() {
 }
 
 #[test]
+fn replace_single_quoted_attr_with_apostrophe() {
+    // Source attribute uses single quotes; the new value contains an
+    // apostrophe, which must be escaped to keep the XML valid.
+    let xml = r#"<doc><meta author='Sachin'/></doc>"#;
+    let out = extract("q.xml", xml.as_bytes()).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_attr(&out.envelope, "author", "Sachin");
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/attrs/author"),
+            value: "O'Brien".to_string(),
+        }],
+    };
+    let s = String::from_utf8(reconstruct(&out.envelope, idmap, xml.as_bytes(), &patch).unwrap())
+        .unwrap();
+    assert!(s.contains("author='O&apos;Brien'"), "got: {s}");
+    // The single-quote delimiters are intact and not broken by a raw apostrophe.
+    assert!(!s.contains("'O'Brien'"));
+}
+
+#[test]
 fn add_after_and_remove() {
     let bytes = SAMPLE.as_bytes();
     let out = extract("sample.xml", bytes).unwrap();
@@ -606,6 +627,18 @@ fn drawio_compressed_diagram_edits_and_reencodes() {
     // Re-extracting decodes the recompressed blob and shows the edit.
     let out2 = extract("flow.drawio", &new).unwrap();
     let _ = id_with_attr(&out2.envelope, "value", "Begin"); // panics if missing
+}
+
+#[test]
+fn drawio_diagram_tag_with_gt_in_attribute() {
+    // A `>` inside the diagram's name attribute must not be mistaken for the
+    // end of the open tag.
+    let blob = compress_diagram(MODEL_A.as_bytes());
+    let file =
+        format!(r#"<mxfile><diagram id="d1" name="A&gt;B is x>y">{blob}</diagram></mxfile>"#);
+    let out = extract("gt.drawio", file.as_bytes()).unwrap();
+    // Decoding the blob succeeded and the cell is visible.
+    let _ = id_with_attr(&out.envelope, "value", "Start");
 }
 
 #[test]
