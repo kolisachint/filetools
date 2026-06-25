@@ -533,3 +533,120 @@ fn pptx_cross_part_patch_aborts_atomically() {
     };
     assert!(reconstruct(&out.envelope, idmap, &pptx, &patch).is_err());
 }
+
+#[test]
+fn xlsx_edits_worksheet_cell_value() {
+    let shared = r#"<?xml version="1.0"?><sst xmlns="x"><si><t>Region</t></si></sst>"#;
+    let workbook = r#"<?xml version="1.0"?><workbook/>"#;
+    let sheet = r#"<?xml version="1.0"?><worksheet xmlns="x"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#;
+    let xlsx = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("xl/workbook.xml", workbook),
+        ("xl/sharedStrings.xml", shared),
+        ("xl/worksheets/sheet1.xml", sheet),
+    ]);
+
+    let out = extract("book.xlsx", &xlsx).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+
+    // The numeric cell value is an editable node in the worksheet part.
+    let id = id_with_text(&out.envelope, "42");
+    assert_eq!(idmap.get(&id).unwrap().part, "xl/worksheets/sheet1.xml");
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "43".to_string(),
+        }],
+    };
+    let new = reconstruct(&out.envelope, idmap, &xlsx, &patch).unwrap();
+    assert!(read_docx_part(&new, "xl/worksheets/sheet1.xml").contains("<v>43</v>"));
+    // sharedStrings untouched.
+    assert_eq!(read_docx_part(&new, "xl/sharedStrings.xml"), shared);
+}
+
+// --- drawio compression -----------------------------------------------------
+
+use filetools::handlers::drawio::{compress_diagram, decompress_diagram};
+
+const MODEL_A: &str =
+    r#"<mxGraphModel><root><mxCell id="2" value="Start" vertex="1"/></root></mxGraphModel>"#;
+
+#[test]
+fn drawio_compression_roundtrips() {
+    let blob = compress_diagram(MODEL_A.as_bytes());
+    let back = decompress_diagram(blob.as_bytes()).unwrap();
+    assert_eq!(back, MODEL_A.as_bytes());
+}
+
+#[test]
+fn drawio_compressed_diagram_edits_and_reencodes() {
+    let blob = compress_diagram(MODEL_A.as_bytes());
+    let file =
+        format!(r#"<mxfile host="app"><diagram id="d1" name="Page-1">{blob}</diagram></mxfile>"#);
+    let bytes = file.as_bytes();
+
+    let out = extract("flow.drawio", bytes).unwrap();
+    assert_eq!(out.envelope.source.r#type, "drawio");
+    let idmap = out.idmap.as_ref().unwrap();
+
+    let id = id_with_attr(&out.envelope, "value", "Start");
+    assert_eq!(idmap.get(&id).unwrap().part, "diagram:0");
+
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/attrs/value"),
+            value: "Begin".to_string(),
+        }],
+    };
+    let new = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap();
+    let s = String::from_utf8(new.clone()).unwrap();
+    // Outer mxfile structure preserved.
+    assert!(s.starts_with(r#"<mxfile host="app">"#));
+    assert!(s.contains(r#"<diagram id="d1" name="Page-1">"#));
+    // Re-extracting decodes the recompressed blob and shows the edit.
+    let out2 = extract("flow.drawio", &new).unwrap();
+    let _ = id_with_attr(&out2.envelope, "value", "Begin"); // panics if missing
+}
+
+#[test]
+fn drawio_untouched_diagram_blob_is_preserved() {
+    let model_b =
+        r#"<mxGraphModel><root><mxCell id="3" value="Bee" vertex="1"/></root></mxGraphModel>"#;
+    let b1 = compress_diagram(MODEL_A.as_bytes());
+    let b2 = compress_diagram(model_b.as_bytes());
+    let file = format!(
+        r#"<mxfile><diagram id="p1">{b1}</diagram><diagram id="p2">{b2}</diagram></mxfile>"#
+    );
+    let bytes = file.as_bytes();
+
+    let out = extract("two.drawio", bytes).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    // Two diagrams => two _diagram markers.
+    assert_eq!(
+        out.envelope
+            .structure
+            .iter()
+            .filter(|n| n.tag == "_diagram")
+            .count(),
+        2
+    );
+
+    // Edit only the first diagram's cell.
+    let id = id_with_attr(&out.envelope, "value", "Start");
+    assert_eq!(idmap.get(&id).unwrap().part, "diagram:0");
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/attrs/value"),
+            value: "Started".to_string(),
+        }],
+    };
+    let new = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap();
+    let s = String::from_utf8(new).unwrap();
+    // The second, untouched diagram keeps its exact original blob.
+    assert!(
+        s.contains(&b2),
+        "untouched diagram blob must be byte-identical"
+    );
+    // The first diagram's blob changed (recompressed with the edit).
+    assert!(!s.contains(&b1));
+}

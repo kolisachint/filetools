@@ -29,8 +29,9 @@ Working vertical slice:
 | xlsx (edits `xl/sharedStrings.xml`) | ✅ |
 | pptx (edits every `ppt/slides/slideN.xml`, multi-part) | ✅ |
 | Run-merging text layer (paragraph = one editable string) | ✅ |
+| xlsx worksheet cells (`<v>` / inline `<t>`) | ✅ |
+| drawio compressed `<diagram>` (deflate/base64) | ✅ |
 | PDF (in-place content patching) | ⏳ planned |
-| drawio compressed `<diagram>` inflate | ⏳ planned |
 
 ### OOXML (docx / xlsx / pptx)
 
@@ -57,8 +58,23 @@ run(s) it actually touches, and leaves every other run **byte-identical** —
 so formatting on untouched runs (bold, colour, etc.) is preserved exactly. This
 realises the locked "flatten but preserve untouched runs" decision.
 
-xlsx worksheet cells (numeric/ref) and per-sheet inline strings aren't surfaced
-yet.
+xlsx covers shared strings **and** worksheets: cell values (`<v>`) and inline
+strings (`<t>`) in `xl/worksheets/sheetN.xml` are editable text nodes. Note a
+shared-string cell's `<v>` is an *index* into the strings table — edit the text
+via `xl/sharedStrings.xml`, not the index.
+
+### drawio (compressed and uncompressed)
+
+A bare `<mxGraphModel>` file is handled as plain whole-file XML (fully
+byte-lossless). A real `<mxfile>` holds one or more `<diagram>` parts, each
+storing the model either inline or — by default — **compressed** as
+`base64(deflateRaw(encodeURIComponent(xml)))`. The handler treats each diagram
+as a part whose editable stream is the decoded inner XML (same container model
+as OOXML): edits are spliced into the decoded XML, the diagram is re-encoded,
+and the new blob is spliced into the outer file. **Untouched diagrams keep their
+original blob byte-for-byte**; only edited diagrams are recompressed (deflate
+output isn't byte-stable, but the decoded XML differs only in the edited spans).
+The codec is verified against real drawio output, not just itself.
 
 ## Usage
 

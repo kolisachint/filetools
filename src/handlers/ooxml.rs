@@ -56,11 +56,26 @@ pub fn docx() -> OoxmlHandler {
     }
 }
 
-/// xlsx: edits the shared-strings table; strings `si`, runs `t`.
+/// xlsx: edits the shared-strings table (rich-text strings `si`/`t` are merged)
+/// plus every worksheet (cell values `<v>` and inline-string `<t>` become
+/// editable text nodes).
 pub fn xlsx() -> OoxmlHandler {
     OoxmlHandler {
         type_name: "xlsx",
-        select: |names| pick_exact(names, "xl/sharedStrings.xml"),
+        select: |names| {
+            let mut v: Vec<String> = names
+                .iter()
+                .filter(|n| {
+                    *n == "xl/sharedStrings.xml"
+                        || (n.starts_with("xl/worksheets/sheet")
+                            && n.ends_with(".xml")
+                            && !n.contains("/_rels/"))
+                })
+                .cloned()
+                .collect();
+            v.sort();
+            v
+        },
         para: "si",
         run: "t",
     }
