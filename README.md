@@ -32,7 +32,7 @@ Working vertical slice:
 | Run-merging text layer (paragraph = one editable string) | ✅ |
 | xlsx worksheet cells (`<v>` / inline `<t>`) | ✅ |
 | drawio compressed `<diagram>` (deflate/base64) | ✅ |
-| PDF (in-place content patching) | ⏳ planned |
+| PDF text replacement (layout-preserving) | ✅ |
 
 ### OOXML (docx / xlsx / pptx)
 
@@ -76,6 +76,24 @@ and the new blob is spliced into the outer file. **Untouched diagrams keep their
 original blob byte-for-byte**; only edited diagrams are recompressed (deflate
 output isn't byte-stable, but the decoded XML differs only in the edited spans).
 The codec is verified against real drawio output, not just itself.
+
+### PDF (`in_place_text`)
+
+PDF has no document tree: text is drawn by operators (`Tj`, `TJ`, `'`, `"`)
+inside compressed content streams. The handler (via `lopdf`) decodes each page's
+content stream and exposes the literal strings as editable text nodes. A
+text-replace substitutes the string and re-encodes the content stream, leaving
+every glyph position untouched — a **layout-preserving, text-level edit, never a
+reflow**. Text ids are derived from page/string position and recomputed on both
+sides, so nothing positional is persisted; hash guards work against the current
+string bytes.
+
+Limits: text `replace` only (no `add`/`remove`/`attr`). Strings are treated as
+Latin-1/ASCII; documents with custom font encodings or `ToUnicode` maps may not
+round-trip non-ASCII text. Length-changing edits are allowed but, with no
+reflow, a much longer string can overrun its box. Reconstruct re-serialises the
+document (all original objects retained) rather than appending an incremental
+update.
 
 ## Usage
 
@@ -156,8 +174,8 @@ Each handler declares what it can promise:
 
 - **`lossless`** (xml, drawio) — untouched bytes reproduced exactly;
   verify-on-extract enforces span correctness before output is trusted.
-- **`in_place_text`** (pdf, planned) — surgical text edits only; edits that
-  don't fit the existing layout are rejected.
+- **`in_place_text`** (pdf) — layout-preserving text replacement only; glyph
+  positions are untouched and there is no reflow.
 - **`read_only`** (unknown binary) — best-effort text extraction,
   `writable: false`, reconstruct refused.
 

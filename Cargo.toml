@@ -16,6 +16,10 @@ sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 base64 = "0.22"
+lopdf = "0.36"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
+
+[dev-dependencies]
+lopdf = "0.36"

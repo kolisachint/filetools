@@ -2,6 +2,7 @@
 
 pub mod drawio;
 pub mod ooxml;
+pub mod pdf;
 pub mod readonly;
 pub mod xml;
 
@@ -45,6 +46,7 @@ pub fn for_path(path: &str, bytes: &[u8]) -> Box<dyn Handler> {
         "docx" => Box::new(ooxml::docx()),
         "xlsx" => Box::new(ooxml::xlsx()),
         "pptx" => Box::new(ooxml::pptx()),
+        "pdf" => Box::new(pdf::PdfHandler),
         "drawio" | "dio" => Box::new(drawio::DrawioHandler),
         "xml" | "svg" | "xhtml" => Box::new(xml::XmlHandler),
         _ => {
@@ -64,6 +66,7 @@ pub fn for_type(type_name: &str) -> Option<Box<dyn Handler>> {
         "docx" => Some(Box::new(ooxml::docx())),
         "xlsx" => Some(Box::new(ooxml::xlsx())),
         "pptx" => Some(Box::new(ooxml::pptx())),
+        "pdf" => Some(Box::new(pdf::PdfHandler)),
         "drawio" => Some(Box::new(drawio::DrawioHandler)),
         "xml" => Some(Box::new(xml::XmlHandler)),
         "binary" => Some(Box::new(readonly::ReadOnlyHandler)),

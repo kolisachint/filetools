@@ -650,3 +650,115 @@ fn drawio_untouched_diagram_blob_is_preserved() {
     // The first diagram's blob changed (recompressed with the edit).
     assert!(!s.contains(&b1));
 }
+
+// --- PDF (InPlaceText) ------------------------------------------------------
+
+use lopdf::content::{Content, Operation};
+use lopdf::{dictionary, Document, Object, Stream};
+
+/// Build a one-page PDF drawing each string with its own `Tj`.
+fn build_pdf(texts: &[&str]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+    });
+    let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+
+    let mut ops = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 24.into()]),
+    ];
+    let mut y = 700;
+    for t in texts {
+        ops.push(Operation::new("Td", vec![72.into(), y.into()]));
+        ops.push(Operation::new("Tj", vec![Object::string_literal(*t)]));
+        y -= 40;
+    }
+    ops.push(Operation::new("ET", vec![]));
+
+    let content = Content { operations: ops };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+    });
+    let pages = dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+    };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn pdf_text_edit_preserves_other_text() {
+    let pdf = build_pdf(&["Hello World!", "Second line"]);
+    let out = extract("doc.pdf", &pdf).unwrap();
+    assert_eq!(out.envelope.source.r#type, "pdf");
+    assert_eq!(
+        out.envelope.fidelity,
+        filetools::model::Fidelity::InPlaceText
+    );
+
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_text(&out.envelope, "Hello World!");
+    let guard = idmap.get(&id).unwrap().hash.clone();
+    let patch = Patch {
+        patch: vec![
+            Op::Test {
+                path: format!("/structure/{id}"),
+                hash: guard,
+            },
+            Op::Replace {
+                path: format!("/structure/{id}/text"),
+                value: "Goodbye World!".to_string(),
+            },
+        ],
+    };
+    let new = reconstruct(&out.envelope, idmap, &pdf, &patch).unwrap();
+
+    // Re-extract the rebuilt PDF: the edit landed, the other string is intact.
+    let out2 = extract("doc.pdf", &new).unwrap();
+    let _ = id_with_text(&out2.envelope, "Goodbye World!"); // panics if missing
+    let _ = id_with_text(&out2.envelope, "Second line"); // untouched, preserved
+}
+
+#[test]
+fn pdf_stale_guard_aborts() {
+    let pdf = build_pdf(&["Hello"]);
+    let out = extract("d.pdf", &pdf).unwrap();
+    let id = id_with_text(&out.envelope, "Hello");
+    let patch = Patch {
+        patch: vec![
+            Op::Test {
+                path: format!("/structure/{id}"),
+                hash: "sha256:bad".to_string(),
+            },
+            Op::Replace {
+                path: format!("/structure/{id}/text"),
+                value: "X".to_string(),
+            },
+        ],
+    };
+    assert!(reconstruct(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
+}
+
+#[test]
+fn pdf_rejects_structural_ops() {
+    let pdf = build_pdf(&["Hello"]);
+    let out = extract("d.pdf", &pdf).unwrap();
+    let id = id_with_text(&out.envelope, "Hello");
+    let patch = Patch {
+        patch: vec![Op::Remove {
+            path: format!("/structure/{id}"),
+        }],
+    };
+    assert!(reconstruct(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
+}
