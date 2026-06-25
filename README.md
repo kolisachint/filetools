@@ -25,24 +25,33 @@ Working vertical slice:
 | Verify-on-extract (span/hash self-check) | ✅ |
 | Source-hash drift detection on reconstruct | ✅ |
 | Read-only fallback for unknown binary | ✅ |
-| docx (zip container, edits `word/document.xml`) | ✅ |
-| xlsx / pptx (multi-part containers) | ⏳ next — shares the container plumbing |
+| docx (edits `word/document.xml`) | ✅ |
+| xlsx (edits `xl/sharedStrings.xml`) | ✅ |
+| pptx (edits every `ppt/slides/slideN.xml`, multi-part) | ✅ |
 | PDF (in-place content patching) | ⏳ planned |
 | drawio compressed `<diagram>` inflate | ⏳ planned |
+| docx/pptx run-merging text layer | ⏳ planned |
 
-### OOXML / docx
+### OOXML (docx / xlsx / pptx)
 
-A docx is a zip of XML parts. The handler pulls `word/document.xml`, runs the
-lossless XML core on it, and on reconstruct repackages the zip with that one
-part replaced — **every other entry is copied through with its original
-compressed bytes untouched**, so nothing outside the edited part changes. A
-no-op patch returns the container byte-identical.
+An OOXML file is a zip of XML parts. The handler selects the relevant part(s)
+per format, runs the lossless XML core on each, and records which `part` every
+node's spans index into. On reconstruct it routes each patch op to its target
+node's part, splices the edits, and repackages the zip with the changed parts
+replaced — **every other entry is copied through with its original compressed
+bytes untouched**, so nothing outside the edited parts changes. Edits spanning
+multiple parts (e.g. several pptx slides in one patch) are applied atomically:
+if any part fails a guard, the container is not rebuilt. A no-op patch returns
+the container byte-identical.
 
-Editable nodes are the `w:t` text runs (docx splits text across runs). A richer
-layer that merges runs into paragraph-level text — while preserving untouched
-runs per the inline-text decision — is future work. xlsx (`xl/sharedStrings.xml`
-plus per-sheet parts) and pptx (per-slide parts) need multi-part addressing and
-reuse this same container layer.
+Part selection: docx → `word/document.xml`; xlsx → `xl/sharedStrings.xml`
+(human-readable cell text); pptx → every `ppt/slides/slideN.xml` (each wrapped
+under a synthetic, non-editable `_part` marker so slides stay distinguishable).
+
+Editable nodes are the leaf text runs (`w:t` / `a:t` / `t`), since OOXML splits
+text across runs. A richer layer that merges runs into paragraph-level text —
+preserving untouched runs per the inline-text decision — is future work. xlsx
+worksheet cells (numeric/ref) and per-sheet inline strings aren't surfaced yet.
 
 ## Usage
 

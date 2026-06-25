@@ -28,7 +28,7 @@ impl super::Handler for DrawioHandler {
         bytes: &[u8],
         for_hash: &str,
     ) -> anyhow::Result<(Vec<DocNode>, Option<IdMap>)> {
-        let e = super::xml::extract(bytes, for_hash)?;
+        let e = super::xml::extract(bytes, for_hash, "")?;
         Ok((e.nodes, Some(e.idmap)))
     }
 }

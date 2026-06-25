@@ -27,6 +27,11 @@ impl Span {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeLoc {
     pub tag: String,
+    /// For container formats (OOXML), the zip entry the spans index into
+    /// (e.g. `word/document.xml`, `ppt/slides/slide1.xml`). Empty for
+    /// single-stream formats where spans index into the whole file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub part: String,
     /// Full element span: from the `<` of the open tag through the `>` of the
     /// close tag (or the whole self-closing tag).
     pub element: Span,

@@ -335,3 +335,139 @@ fn docx_edit_is_surgical_and_repackages() {
     // Re-extracting the rebuilt docx still verifies (spans are consistent).
     extract("report.docx", &new_docx).unwrap();
 }
+
+// --- xlsx / pptx (multi-part containers) ------------------------------------
+
+/// Build a zip container from (name, body) parts.
+fn build_zip(parts: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in parts {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(body.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+    out
+}
+
+#[test]
+fn xlsx_edits_shared_strings() {
+    let shared = r#"<?xml version="1.0"?><sst xmlns="x" count="2"><si><t>Region</t></si><si><t>APAC</t></si></sst>"#;
+    let workbook = r#"<?xml version="1.0"?><workbook/>"#;
+    let xlsx = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("xl/workbook.xml", workbook),
+        ("xl/sharedStrings.xml", shared),
+    ]);
+
+    let out = extract("book.xlsx", &xlsx).unwrap();
+    assert_eq!(out.envelope.source.r#type, "xlsx");
+    let idmap = out.idmap.as_ref().unwrap();
+
+    let id = id_with_text(&out.envelope, "Region");
+    // The node's part should be the shared-strings table.
+    assert_eq!(idmap.get(&id).unwrap().part, "xl/sharedStrings.xml");
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "Area".to_string(),
+        }],
+    };
+    let new = reconstruct(&out.envelope, idmap, &xlsx, &patch).unwrap();
+    let s = read_docx_part(&new, "xl/sharedStrings.xml");
+    assert!(s.contains("<t>Area</t>"));
+    assert!(s.contains("<t>APAC</t>"));
+    // Untouched part preserved.
+    assert_eq!(read_docx_part(&new, "xl/workbook.xml"), workbook);
+}
+
+#[test]
+fn pptx_edits_multiple_slides_atomically() {
+    let slide1 =
+        r#"<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><a:t>Title One</a:t></p:sld>"#;
+    let slide2 =
+        r#"<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><a:t>Title Two</a:t></p:sld>"#;
+    let pptx = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("ppt/slides/slide1.xml", slide1),
+        ("ppt/slides/slide2.xml", slide2),
+        ("ppt/slides/_rels/slide1.xml.rels", RELS),
+    ]);
+
+    let out = extract("deck.pptx", &pptx).unwrap();
+    assert_eq!(out.envelope.source.r#type, "pptx");
+    let idmap = out.idmap.as_ref().unwrap();
+
+    // Two slides => two synthetic _part wrappers in the structure.
+    let part_markers = out
+        .envelope
+        .structure
+        .iter()
+        .filter(|n| n.tag == "_part")
+        .count();
+    assert_eq!(part_markers, 2);
+
+    let id1 = id_with_text(&out.envelope, "Title One");
+    let id2 = id_with_text(&out.envelope, "Title Two");
+    assert_eq!(idmap.get(&id1).unwrap().part, "ppt/slides/slide1.xml");
+    assert_eq!(idmap.get(&id2).unwrap().part, "ppt/slides/slide2.xml");
+
+    // One patch spanning both slides — applied atomically across parts.
+    let patch = Patch {
+        patch: vec![
+            Op::Replace {
+                path: format!("/structure/{id1}/text"),
+                value: "Opening".to_string(),
+            },
+            Op::Replace {
+                path: format!("/structure/{id2}/text"),
+                value: "Closing".to_string(),
+            },
+        ],
+    };
+    let new = reconstruct(&out.envelope, idmap, &pptx, &patch).unwrap();
+    assert!(read_docx_part(&new, "ppt/slides/slide1.xml").contains("<a:t>Opening</a:t>"));
+    assert!(read_docx_part(&new, "ppt/slides/slide2.xml").contains("<a:t>Closing</a:t>"));
+    // The rels part (not selected) is preserved.
+    assert_eq!(
+        read_docx_part(&new, "ppt/slides/_rels/slide1.xml.rels"),
+        RELS
+    );
+}
+
+#[test]
+fn pptx_cross_part_patch_aborts_atomically() {
+    let slide1 =
+        r#"<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><a:t>Title One</a:t></p:sld>"#;
+    let slide2 =
+        r#"<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><a:t>Title Two</a:t></p:sld>"#;
+    let pptx = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("ppt/slides/slide1.xml", slide1),
+        ("ppt/slides/slide2.xml", slide2),
+    ]);
+    let out = extract("deck.pptx", &pptx).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    let id1 = id_with_text(&out.envelope, "Title One");
+    let id2 = id_with_text(&out.envelope, "Title Two");
+
+    // A valid edit on slide1 plus a stale guard on slide2 must abort the whole
+    // patch — the container is returned only if every part applied cleanly.
+    let patch = Patch {
+        patch: vec![
+            Op::Replace {
+                path: format!("/structure/{id1}/text"),
+                value: "Opening".to_string(),
+            },
+            Op::Test {
+                path: format!("/structure/{id2}"),
+                hash: "sha256:bad".to_string(),
+            },
+        ],
+    };
+    assert!(reconstruct(&out.envelope, idmap, &pptx, &patch).is_err());
+}

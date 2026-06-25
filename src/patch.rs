@@ -43,6 +43,27 @@ pub enum Op {
     Remove { path: String },
 }
 
+impl Op {
+    /// The node id this op references — its target's id, or an `add`'s anchor.
+    /// Used to route ops to the right container part.
+    pub fn target_id(&self) -> Option<&str> {
+        match self {
+            Op::Test { path, .. } | Op::Replace { path, .. } | Op::Remove { path } => {
+                pointer_id(path)
+            }
+            Op::Add { after, before, .. } => after.as_deref().or(before.as_deref()),
+        }
+    }
+}
+
+/// Extract the `<id>` from a `/structure/<id>...` pointer.
+fn pointer_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/structure/")?
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Patch {
     pub patch: Vec<Op>,

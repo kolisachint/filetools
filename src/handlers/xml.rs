@@ -31,7 +31,7 @@ impl super::Handler for XmlHandler {
         bytes: &[u8],
         for_hash: &str,
     ) -> anyhow::Result<(Vec<DocNode>, Option<IdMap>)> {
-        let e = extract(bytes, for_hash)?;
+        let e = extract(bytes, for_hash, "")?;
         Ok((e.nodes, Some(e.idmap)))
     }
 }
@@ -59,7 +59,10 @@ struct Frame {
     id: String,
 }
 
-pub fn extract(bytes: &[u8], for_hash: &str) -> anyhow::Result<Extracted> {
+/// Extract one XML stream. `part` labels which container entry the bytes came
+/// from (empty for a standalone file); it seeds structural-path ids so ids are
+/// unique across parts, and is stamped onto every `NodeLoc`.
+pub fn extract(bytes: &[u8], for_hash: &str, part: &str) -> anyhow::Result<Extracted> {
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = false;
@@ -83,7 +86,7 @@ pub fn extract(bytes: &[u8], for_hash: &str) -> anyhow::Result<Extracted> {
                     &bytes[start..end],
                     start,
                     end,
-                    parent_path_and_counts(&mut stack, &mut root_counts),
+                    parent_path_and_counts(&mut stack, &mut root_counts, part),
                     &mut used_ids,
                 );
                 stack.push(frame);
@@ -94,7 +97,7 @@ pub fn extract(bytes: &[u8], for_hash: &str) -> anyhow::Result<Extracted> {
                     &bytes[start..end],
                     start,
                     end,
-                    parent_path_and_counts(&mut stack, &mut root_counts),
+                    parent_path_and_counts(&mut stack, &mut root_counts, part),
                     &mut used_ids,
                 );
                 // Self-closing: finalize immediately, no inner content.
@@ -134,6 +137,11 @@ pub fn extract(bytes: &[u8], for_hash: &str) -> anyhow::Result<Extracted> {
         buf.clear();
     }
 
+    // Stamp the part label onto every recorded node.
+    for loc in idmap.values_mut() {
+        loc.part = part.to_string();
+    }
+
     Ok(Extracted {
         nodes: roots,
         idmap: IdMap {
@@ -144,17 +152,19 @@ pub fn extract(bytes: &[u8], for_hash: &str) -> anyhow::Result<Extracted> {
 }
 
 /// Borrow the parent's path/counters (or the root counters) to assign a
-/// stable structural-path id to a new child.
+/// stable structural-path id to a new child. Root-level elements seed their
+/// path with `root_path` (the part name) so ids are unique across parts.
 fn parent_path_and_counts<'a>(
     stack: &'a mut Vec<Frame>,
     root_counts: &'a mut HashMap<String, u32>,
+    root_path: &str,
 ) -> (String, &'a mut HashMap<String, u32>) {
     match stack.last_mut() {
         Some(p) => {
             p.complex = true; // a parent with an element child is not a text leaf
             (p.path.clone(), &mut p.sibling_counts)
         }
-        None => (String::new(), root_counts),
+        None => (root_path.to_string(), root_counts),
     }
 }
 
@@ -254,6 +264,7 @@ fn emit(
         frame.id.clone(),
         NodeLoc {
             tag: frame.tag.clone(),
+            part: String::new(), // stamped after the parse loop
             element,
             inner,
             attrs: frame.attr_spans,
