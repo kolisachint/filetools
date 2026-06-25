@@ -1,14 +1,14 @@
-//! `hoo-extract` — CLI for the reversible file serialization format.
+//! `filetools` — CLI for the reversible file serialization format.
 //!
 //!   # extract -> envelope JSON (+ sidecar id-map next to it)
-//!   hoo-extract extract --input report.xml --out report.hoo.json
+//!   filetools extract --input report.xml --out report.ft.json
 //!
 //!   # reconstruct: apply a patch back into the original format
-//!   hoo-extract reconstruct --envelope report.hoo.json --patch patch.json \
-//!                           --out report_v2.xml
+//!   filetools reconstruct --envelope report.ft.json --patch patch.json \
+//!                         --out report_v2.xml
 //!
 //!   # read-only view (no ids, max token savings)
-//!   hoo-extract extract --input data.bin --readonly
+//!   filetools extract --input data.bin --readonly
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use filetools::patch::Patch;
 
 #[derive(Parser)]
 #[command(
-    name = "hoo-extract",
+    name = "filetools",
     about = "Reversible, token-efficient file serialization for LLMs"
 )]
 struct Cli {
@@ -36,7 +36,7 @@ enum Cmd {
     Extract {
         #[arg(long)]
         input: PathBuf,
-        /// Envelope output path. Defaults to `<input>.hoo.json`.
+        /// Envelope output path. Defaults to `<input>.ft.json`.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Strip ids and skip the sidecar — analysis-only, max token savings.
@@ -83,7 +83,7 @@ fn cmd_extract(input: &Path, out: Option<&Path>, readonly: bool) -> Result<()> {
 
     let envelope_path = out
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| with_suffix(input, ".hoo.json"));
+        .unwrap_or_else(|| with_suffix(input, ".ft.json"));
 
     if readonly {
         // Strip ids for analysis: smaller, but not reconstructable.
@@ -169,7 +169,7 @@ fn strip_ids(env: &mut Envelope) {
     walk(&mut env.structure);
 }
 
-/// `report.xml` + `.hoo.json` -> `report.hoo.json`.
+/// `report.xml` + `.ft.json` -> `report.ft.json`.
 fn with_suffix(input: &Path, suffix: &str) -> PathBuf {
     let stem = input
         .file_stem()

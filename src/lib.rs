@@ -1,5 +1,4 @@
-//! filetools / `hoo-extract`: a reversible, token-efficient file serialization
-//! format for LLMs.
+//! filetools: a reversible, token-efficient file serialization format for LLMs.
 //!
 //! Extract a file to compact semantic JSON (the *envelope*) plus a sidecar
 //! id-map. An LLM edits nodes and returns an RFC-6902-style patch. Reconstruct

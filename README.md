@@ -1,6 +1,7 @@
-# filetools — `hoo-extract`
+# filetools
 
-A reversible, token-efficient file serialization format for LLMs.
+A reversible, token-efficient file serialization format for LLMs. The `filetools`
+CLI extracts a file to editable JSON and reconstructs it after edits.
 
 Extract a file to compact semantic JSON (an **envelope**), let an LLM edit
 nodes and return a patch, then reconstruct the original format **losslessly** —
@@ -18,7 +19,7 @@ Working vertical slice:
 | Capability | State |
 |---|---|
 | Generic XML (lossless, in-place byte-splice) | ✅ |
-| drawio (thin semantic layer over XML) | ✅ (uncompressed) |
+| drawio (semantic layer over XML) | ✅ |
 | Sidecar id-map + content-addressed ids | ✅ |
 | RFC-6902-style patches (id-based pointers) | ✅ |
 | Hash-guarded ops, atomic all-or-nothing apply | ✅ |
@@ -80,14 +81,14 @@ The codec is verified against real drawio output, not just itself.
 
 ```bash
 # Extract -> envelope JSON (+ sidecar id-map written alongside)
-hoo-extract extract --input report.xml --out report.hoo.json
+filetools extract --input report.xml --out report.ft.json
 
 # Reconstruct: apply a patch back into the original format
-hoo-extract reconstruct --envelope report.hoo.json --patch patch.json \
+filetools reconstruct --envelope report.ft.json --patch patch.json \
                         --out report_v2.xml
 
 # Read-only view: strip ids, no sidecar, max token savings
-hoo-extract extract --input data.bin --readonly
+filetools extract --input data.bin --readonly
 ```
 
 ## Envelope
@@ -167,8 +168,6 @@ Each handler declares what it can promise:
 - Inserted elements carry plain text only (no inline formatting yet).
 - `add` inserts exactly at the anchor's byte boundary, so inserted nodes are
   not auto-indented.
-- drawio handles the uncompressed form; compressed `<diagram>` payloads aren't
-  inflated yet.
 
 ## Build & test
 

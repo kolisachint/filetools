@@ -5,8 +5,8 @@ edition = "2021"
 description = "Reversible, token-efficient file serialization for LLMs: extract to semantic JSON, patch, reconstruct losslessly."
 
 [[bin]]
-name = "hoo-extract"
-path = "src/bin/hoo-extract.rs"
+name = "filetools"
+path = "src/bin/filetools.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
