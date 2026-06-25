@@ -184,13 +184,19 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
                         let loc = idmap
                             .get(id)
                             .ok_or_else(|| PatchError::UnknownId(id.to_string()))?;
-                        let inner = loc
-                            .inner
-                            .ok_or_else(|| PatchError::NotTextReplaceable(i, id.to_string()))?;
-                        edits.push(Edit {
-                            range: inner,
-                            bytes: xml_escape_text(value).into_bytes(),
-                        });
+                        if let Some(runs) = &loc.runs {
+                            // Merged paragraph: diff old-vs-new text and rewrite
+                            // only the runs that actually changed.
+                            edits.extend(run_replace(original, runs, value, i, id)?);
+                        } else {
+                            let inner = loc
+                                .inner
+                                .ok_or_else(|| PatchError::NotTextReplaceable(i, id.to_string()))?;
+                            edits.push(Edit {
+                                range: inner,
+                                bytes: xml_escape_text(value).into_bytes(),
+                            });
+                        }
                     }
                     Target::Attr(id, name) => {
                         let loc = idmap
@@ -253,6 +259,96 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
     }
 
     splice(original, edits)
+}
+
+/// Replace the merged text of a paragraph by editing only the runs that
+/// changed. The runs' inner spans tile the paragraph text in order; we diff
+/// the old concatenation against the new (escaped) value, place all new content
+/// into the first run the change touches, empty fully-replaced runs, and keep
+/// the tail of the last touched run — every run outside the changed range is
+/// left byte-identical (no edit emitted).
+fn run_replace(
+    original: &[u8],
+    runs: &[Span],
+    value: &str,
+    op: usize,
+    id: &str,
+) -> Result<Vec<Edit>, PatchError> {
+    if runs.is_empty() {
+        return Err(PatchError::NotTextReplaceable(op, id.to_string()));
+    }
+    // Run-local old bytes and their offsets within the merged text.
+    let olds: Vec<&[u8]> = runs.iter().map(|r| &original[r.start..r.end]).collect();
+    let mut starts = Vec::with_capacity(runs.len());
+    let mut acc = 0usize;
+    for o in &olds {
+        starts.push(acc);
+        acc += o.len();
+    }
+    let total = acc;
+    let old_raw: Vec<u8> = olds.concat();
+    let new_raw = xml_escape_text(value).into_bytes();
+
+    let p = common_prefix(&old_raw, &new_raw);
+    let s = common_suffix(&old_raw[p..], &new_raw[p..]);
+    let c0 = p;
+    let c1 = old_raw.len() - s;
+    let new_mid = &new_raw[p..new_raw.len() - s];
+
+    // The run that receives the new middle: the one containing c0 (or the last
+    // run if the change is a pure append at the very end).
+    let insert_run = run_at(&starts, &olds, c0).unwrap_or(runs.len() - 1);
+
+    let mut edits = Vec::new();
+    for (i, run) in runs.iter().enumerate() {
+        let a = starts[i];
+        let len = olds[i].len();
+        let cut_before = c0.saturating_sub(a).min(len);
+        let cut_after = c1.saturating_sub(a).min(len);
+        let mut new_run: Vec<u8> = Vec::new();
+        new_run.extend_from_slice(&olds[i][..cut_before]);
+        if i == insert_run {
+            new_run.extend_from_slice(new_mid);
+        }
+        new_run.extend_from_slice(&olds[i][cut_after..]);
+        if new_run != olds[i] {
+            edits.push(Edit {
+                range: *run,
+                bytes: new_run,
+            });
+        }
+    }
+    let _ = total;
+    Ok(edits)
+}
+
+/// Index of the run whose half-open range contains `pos`, or `None` if `pos`
+/// is at the very end of the merged text.
+fn run_at(starts: &[usize], olds: &[&[u8]], pos: usize) -> Option<usize> {
+    for i in 0..starts.len() {
+        let a = starts[i];
+        let b = a + olds[i].len();
+        if pos >= a && pos < b {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[a.len() - 1 - i] == b[b.len() - 1 - i] {
+        i += 1;
+    }
+    i
 }
 
 /// Apply non-overlapping byte edits. Inserts (zero-width ranges) are allowed

@@ -39,6 +39,11 @@ pub struct NodeLoc {
     /// elements with child content (text-replace only allowed when present).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inner: Option<Span>,
+    /// For merged paragraph nodes (OOXML): the ordered inner spans of the text
+    /// runs (`w:t`/`a:t`/`t`) whose concatenation forms the paragraph text.
+    /// A text-replace diffs old-vs-new and rewrites only the affected runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs: Option<Vec<Span>>,
     /// Byte range of each attribute *value* (excluding quotes), keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attrs: BTreeMap<String, Span>,
@@ -85,6 +90,13 @@ pub fn verify_spans(stream: &[u8], map: &IdMap) -> anyhow::Result<()> {
         if let Some(inner) = loc.inner {
             if inner.start < el.start || inner.end > el.end || inner.start > inner.end {
                 bail!("node `{id}`: inner span outside element");
+            }
+        }
+        if let Some(runs) = &loc.runs {
+            for r in runs {
+                if r.start < el.start || r.end > el.end || r.start > r.end {
+                    bail!("node `{id}`: run span outside element");
+                }
             }
         }
         for (name, span) in &loc.attrs {

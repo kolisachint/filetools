@@ -267,6 +267,7 @@ fn emit(
             part: String::new(), // stamped after the parse loop
             element,
             inner,
+            runs: None,
             attrs: frame.attr_spans,
             hash,
         },

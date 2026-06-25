@@ -31,6 +31,28 @@ fn id_with_text(env: &filetools::model::Envelope, needle: &str) -> String {
     walk(&env.structure, needle).expect("node with text not found")
 }
 
+/// Find the first node (at any depth) with the given tag.
+fn node_with_tag<'a>(
+    env: &'a filetools::model::Envelope,
+    tag: &str,
+) -> &'a filetools::model::DocNode {
+    fn walk<'a>(
+        nodes: &'a [filetools::model::DocNode],
+        tag: &str,
+    ) -> Option<&'a filetools::model::DocNode> {
+        for n in nodes {
+            if n.tag == tag {
+                return Some(n);
+            }
+            if let Some(f) = walk(&n.children, tag) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    walk(&env.structure, tag).expect("node with tag not found")
+}
+
 fn id_with_attr(env: &filetools::model::Envelope, name: &str, value: &str) -> String {
     fn walk(nodes: &[filetools::model::DocNode], name: &str, value: &str) -> Option<String> {
         for n in nodes {
@@ -437,6 +459,46 @@ fn pptx_edits_multiple_slides_atomically() {
         read_docx_part(&new, "ppt/slides/_rels/slide1.xml.rels"),
         RELS
     );
+}
+
+#[test]
+fn docx_merges_runs_and_preserves_untouched_run() {
+    // A paragraph split across two runs; the first run is bold.
+    let doc = r#"<?xml version="1.0"?><w:document xmlns:w="w"><w:body><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Hello </w:t></w:r><w:r><w:t>world</w:t></w:r></w:p></w:body></w:document>"#;
+    let docx = build_docx(doc);
+    let out = extract("merge.docx", &docx).unwrap();
+
+    // The paragraph is presented as one merged string; its runs are hidden.
+    let para = node_with_tag(&out.envelope, "w:p");
+    assert_eq!(para.text.as_deref(), Some("Hello world"));
+    assert!(
+        para.children.is_empty(),
+        "runs should be hidden under the paragraph"
+    );
+
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_text(&out.envelope, "Hello world");
+    // The paragraph's id-map entry records its run spans.
+    assert!(idmap.get(&id).unwrap().runs.is_some());
+
+    // Insert a word in the middle of the merged text.
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "Hello brave world".to_string(),
+        }],
+    };
+    let new = reconstruct(&out.envelope, idmap, &docx, &patch).unwrap();
+    let d = read_docx_part(&new, "word/document.xml");
+
+    // The untouched bold run is preserved byte-for-byte...
+    assert!(
+        d.contains("<w:r><w:rPr><w:b/></w:rPr><w:t>Hello </w:t></w:r>"),
+        "bold run must be untouched, got: {d}"
+    );
+    // ...and only the second run was rewritten to carry the change.
+    assert!(d.contains("<w:t>brave world</w:t>"), "got: {d}");
+    assert!(!d.contains("<w:t>world</w:t>"));
 }
 
 #[test]

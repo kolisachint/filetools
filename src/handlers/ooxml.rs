@@ -32,34 +32,41 @@ use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 use super::xml;
-use crate::idmap::{verify_spans, IdMap, NodeLoc};
+use crate::idmap::{verify_spans, IdMap, NodeLoc, Span};
 use crate::model::{Attr, DocNode, Fidelity};
 use crate::patch::{self, Op, Patch};
 
-/// A container handler. `select` chooses which entries to expose for editing,
-/// given the container's full entry list.
+/// A container handler. `select` chooses which entries to expose for editing;
+/// `para`/`run` name the paragraph and text-run tags so runs can be merged into
+/// a single editable string per paragraph.
 pub struct OoxmlHandler {
     type_name: &'static str,
     select: fn(&[String]) -> Vec<String>,
+    para: &'static str,
+    run: &'static str,
 }
 
-/// docx: edits `word/document.xml`.
+/// docx: edits `word/document.xml`; paragraphs `w:p`, runs `w:t`.
 pub fn docx() -> OoxmlHandler {
     OoxmlHandler {
         type_name: "docx",
         select: |names| pick_exact(names, "word/document.xml"),
+        para: "w:p",
+        run: "w:t",
     }
 }
 
-/// xlsx: edits the shared-strings table (human-readable cell text).
+/// xlsx: edits the shared-strings table; strings `si`, runs `t`.
 pub fn xlsx() -> OoxmlHandler {
     OoxmlHandler {
         type_name: "xlsx",
         select: |names| pick_exact(names, "xl/sharedStrings.xml"),
+        para: "si",
+        run: "t",
     }
 }
 
-/// pptx: edits every slide part.
+/// pptx: edits every slide part; paragraphs `a:p`, runs `a:t`.
 pub fn pptx() -> OoxmlHandler {
     OoxmlHandler {
         type_name: "pptx",
@@ -76,6 +83,8 @@ pub fn pptx() -> OoxmlHandler {
             v.sort();
             v
         },
+        para: "a:p",
+        run: "a:t",
     }
 }
 
@@ -105,7 +114,9 @@ impl super::Handler for OoxmlHandler {
 
         for part in &parts {
             let part_bytes = read_part(bytes, part)?;
-            let e = xml::extract(&part_bytes, for_hash, part)?;
+            let mut e = xml::extract(&part_bytes, for_hash, part)?;
+            // Collapse each paragraph's text runs into one editable string.
+            merge_runs(&mut e.nodes, &mut e.idmap, self.para, self.run);
             for (id, loc) in e.idmap.map {
                 merged.insert(id, loc);
             }
@@ -182,6 +193,64 @@ impl super::Handler for OoxmlHandler {
             return Ok(bytes.to_vec());
         }
         repackage(bytes, &new_parts)
+    }
+}
+
+/// Collapse each paragraph's text runs into one editable string node.
+///
+/// For every element tagged `para`, gather its descendant `run` text elements
+/// in document order, set the paragraph's `text` to their concatenation, hide
+/// the runs (clear children), and record the runs' inner spans on the
+/// paragraph's id-map entry so a later text-replace can rewrite only the runs
+/// that changed. The now-hidden descendant nodes are dropped from the id-map.
+fn merge_runs(nodes: &mut [DocNode], idmap: &mut IdMap, para: &str, run: &str) {
+    for node in nodes.iter_mut() {
+        if node.tag == para {
+            let mut spans = Vec::new();
+            let mut text = String::new();
+            let mut dead = Vec::new();
+            collect_runs(node, idmap, run, &mut spans, &mut text, &mut dead);
+            if !spans.is_empty() {
+                if let Some(loc) = idmap.map.get_mut(&node.id) {
+                    loc.inner = None;
+                    loc.runs = Some(spans);
+                }
+                for d in dead {
+                    idmap.map.remove(&d);
+                }
+                node.children.clear();
+                node.text = Some(text);
+            } else {
+                // A paragraph with no text runs (e.g. image-only) stays generic.
+                merge_runs(&mut node.children, idmap, para, run);
+            }
+        } else {
+            merge_runs(&mut node.children, idmap, para, run);
+        }
+    }
+}
+
+fn collect_runs(
+    node: &DocNode,
+    idmap: &IdMap,
+    run: &str,
+    spans: &mut Vec<Span>,
+    text: &mut String,
+    dead: &mut Vec<String>,
+) {
+    for child in &node.children {
+        dead.push(child.id.clone());
+        if child.tag == run {
+            if let Some(loc) = idmap.get(&child.id) {
+                if let Some(inner) = loc.inner {
+                    spans.push(inner);
+                    if let Some(t) = &child.text {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+        collect_runs(child, idmap, run, spans, text, dead);
     }
 }
 

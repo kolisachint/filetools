@@ -28,9 +28,9 @@ Working vertical slice:
 | docx (edits `word/document.xml`) | ✅ |
 | xlsx (edits `xl/sharedStrings.xml`) | ✅ |
 | pptx (edits every `ppt/slides/slideN.xml`, multi-part) | ✅ |
+| Run-merging text layer (paragraph = one editable string) | ✅ |
 | PDF (in-place content patching) | ⏳ planned |
 | drawio compressed `<diagram>` inflate | ⏳ planned |
-| docx/pptx run-merging text layer | ⏳ planned |
 
 ### OOXML (docx / xlsx / pptx)
 
@@ -48,10 +48,17 @@ Part selection: docx → `word/document.xml`; xlsx → `xl/sharedStrings.xml`
 (human-readable cell text); pptx → every `ppt/slides/slideN.xml` (each wrapped
 under a synthetic, non-editable `_part` marker so slides stay distinguishable).
 
-Editable nodes are the leaf text runs (`w:t` / `a:t` / `t`), since OOXML splits
-text across runs. A richer layer that merges runs into paragraph-level text —
-preserving untouched runs per the inline-text decision — is future work. xlsx
-worksheet cells (numeric/ref) and per-sheet inline strings aren't surfaced yet.
+**Run merging.** OOXML splits a paragraph's text across runs (`w:r`/`w:t`) so
+that `Q1 ` and `revenue grew.` may be separate runs. The handler collapses each
+paragraph (`w:p` / `a:p` / xlsx `si`) into a single editable string and hides
+the runs, so the LLM sees `"Q1 revenue grew."` not the run markup. On a
+text-replace it diffs the old text against the new, places the change into the
+run(s) it actually touches, and leaves every other run **byte-identical** —
+so formatting on untouched runs (bold, colour, etc.) is preserved exactly. This
+realises the locked "flatten but preserve untouched runs" decision.
+
+xlsx worksheet cells (numeric/ref) and per-sheet inline strings aren't surfaced
+yet.
 
 ## Usage
 
