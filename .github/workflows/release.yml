@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Version bump & release
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect release label
+        id: label
+        run: |
+          LABELS="${{ github.event.pull_request.labels.*.name }}"
+          if echo "$LABELS" | grep -q "release:major"; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q "release:minor"; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q "release:patch"; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.label.outputs.bump != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump version
+        if: steps.label.outputs.bump != ''
+        id: version
+        run: |
+          BUMP="${{ steps.label.outputs.bump }}"
+          CURRENT=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
+          sed -i "0,/version = \"$CURRENT\"/s//version = \"$NEW\"/" Cargo.toml
+          echo "### Version bumped: $CURRENT → $NEW ($BUMP)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit & push version bump
+        if: steps.label.outputs.bump != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: release v${{ steps.version.outputs.new }}"
+          git tag "v${{ steps.version.outputs.new }}"
+          git push origin main --tags
+
+      - name: Create GitHub release
+        if: steps.label.outputs.bump != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.new }}" \
+            --title "v${{ steps.version.outputs.new }}" \
+            --generate-notes
