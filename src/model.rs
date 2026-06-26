@@ -69,3 +69,87 @@ pub struct Attr {
     pub name: String,
     pub value: String,
 }
+
+// ── Manifest-first API types ──────────────────────────────────────────────
+
+/// Lightweight document manifest returned by `scan()`.
+/// Contains metadata for block selection without hydrating full content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub file_type: FileType,
+    pub block_count: usize,
+    pub total_tokens: usize,
+    pub blocks: Vec<BlockManifest>,
+}
+
+/// Per-block metadata for agent selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockManifest {
+    /// Structural path ID: `section[0]`, `section[0].paragraph[1]`, etc.
+    pub id: String,
+    pub block_type: BlockType,
+    /// First ~100 chars for disambiguation.
+    pub preview: String,
+    /// Content hash for staleness detection.
+    pub content_hash: String,
+    /// Parent block ID, derived from path.
+    pub parent_id: Option<String>,
+    /// Rough token estimate (preview.len() / 4).
+    pub token_estimate: usize,
+    pub section_name: String,
+    pub section_number: usize,
+}
+
+/// Logical file type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileType {
+    Markdown,
+    Ooxml,
+    Xml,
+    Drawio,
+    Pdf,
+    Csv,
+    Html,
+    Image,
+    Archive,
+    Mermaid,
+    Unknown,
+}
+
+/// A single content match returned by `grep()`.
+///
+/// `block_id` is a structural id that resolves directly via `read()`/`edit()`,
+/// so a caller can feed matches straight back into the funnel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepMatch {
+    pub block_id: String,
+    /// 1-based line number within the block's text content.
+    pub line: usize,
+    /// The matching line, truncated for display.
+    pub snippet: String,
+}
+
+/// Options controlling `grep()`.
+#[derive(Debug, Clone, Default)]
+pub struct GrepOptions {
+    /// Case-insensitive matching.
+    pub ignore_case: bool,
+    /// Stop after this many matches. `None` means unbounded.
+    pub limit: Option<usize>,
+}
+
+/// Block type for manifest entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockType {
+    Heading,
+    Paragraph,
+    Table,
+    List,
+    Code,
+    Image,
+    Cell,
+    Section,
+    Other,
+}

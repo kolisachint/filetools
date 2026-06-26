@@ -1,8 +1,8 @@
-//! End-to-end tests for extract -> patch -> reconstruct.
+//! End-to-end tests for extract -> patch -> write.
 
 use filetools_rs::model::Attr;
 use filetools_rs::patch::{NewElement, Op, Patch};
-use filetools_rs::{extract, reconstruct};
+use filetools_rs::{extract, write};
 
 const SAMPLE: &str = r#"<?xml version="1.0"?>
 <doc>
@@ -73,7 +73,7 @@ fn empty_patch_is_byte_identical() {
     let bytes = SAMPLE.as_bytes();
     let out = extract("sample.xml", bytes).unwrap();
     let idmap = out.idmap.as_ref().unwrap();
-    let result = reconstruct(&out.envelope, idmap, bytes, &Patch { patch: vec![] }).unwrap();
+    let result = write(&out.envelope, idmap, bytes, &Patch { patch: vec![] }).unwrap();
     assert_eq!(
         result, bytes,
         "empty patch must reproduce the original exactly"
@@ -108,7 +108,7 @@ fn replace_text_is_surgical() {
             },
         ],
     };
-    let result = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap();
+    let result = write(&out.envelope, idmap, bytes, &patch).unwrap();
     let s = String::from_utf8(result).unwrap();
     assert!(s.contains("<p>First paragraph, revised.</p>"));
     // Everything else untouched.
@@ -137,7 +137,7 @@ fn replace_attribute_value() {
             },
         ],
     };
-    let s = String::from_utf8(reconstruct(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
+    let s = String::from_utf8(write(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
     assert!(s.contains(r#"<meta author="Kolisachint"/>"#));
 }
 
@@ -155,8 +155,8 @@ fn replace_single_quoted_attr_with_apostrophe() {
             value: "O'Brien".to_string(),
         }],
     };
-    let s = String::from_utf8(reconstruct(&out.envelope, idmap, xml.as_bytes(), &patch).unwrap())
-        .unwrap();
+    let s =
+        String::from_utf8(write(&out.envelope, idmap, xml.as_bytes(), &patch).unwrap()).unwrap();
     assert!(s.contains("author='O&apos;Brien'"), "got: {s}");
     // The single-quote delimiters are intact and not broken by a raw apostrophe.
     assert!(!s.contains("'O'Brien'"));
@@ -186,7 +186,7 @@ fn add_after_and_remove() {
             },
         ],
     };
-    let s = String::from_utf8(reconstruct(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
+    let s = String::from_utf8(write(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
     assert!(s.contains("<p>Inserted paragraph.</p>"));
     assert!(!s.contains("Second paragraph"));
     // Insert landed after the first paragraph.
@@ -216,7 +216,7 @@ fn add_with_attributes_serializes_correctly() {
             },
         }],
     };
-    let s = String::from_utf8(reconstruct(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
+    let s = String::from_utf8(write(&out.envelope, idmap, bytes, &patch).unwrap()).unwrap();
     assert!(s.contains(r#"<note level="info">see appendix</note>"#));
 }
 
@@ -239,18 +239,18 @@ fn stale_guard_aborts_atomically() {
             },
         ],
     };
-    let err = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap_err();
+    let err = write(&out.envelope, idmap, bytes, &patch).unwrap_err();
     assert!(err.to_string().contains("guard failed"), "got: {err}");
 }
 
 #[test]
-fn drift_detected_on_reconstruct() {
+fn drift_detected_on_write() {
     let bytes = SAMPLE.as_bytes();
     let out = extract("sample.xml", bytes).unwrap();
     let idmap = out.idmap.as_ref().unwrap();
     // Reconstruct against a *different* original than was extracted.
     let other = b"<doc/>";
-    let err = reconstruct(&out.envelope, idmap, other, &Patch { patch: vec![] }).unwrap_err();
+    let err = write(&out.envelope, idmap, other, &Patch { patch: vec![] }).unwrap_err();
     assert!(err.to_string().contains("drifted"), "got: {err}");
 }
 
@@ -278,8 +278,8 @@ fn drawio_detected_and_roundtrips() {
             value: "Begin".to_string(),
         }],
     };
-    let s = String::from_utf8(reconstruct(&out.envelope, idmap, dio.as_bytes(), &patch).unwrap())
-        .unwrap();
+    let s =
+        String::from_utf8(write(&out.envelope, idmap, dio.as_bytes(), &patch).unwrap()).unwrap();
     assert!(s.contains(r#"value="Begin""#));
     assert!(s.contains(r#"id="2""#));
 }
@@ -332,7 +332,7 @@ fn docx_detected_and_lossless() {
     assert_eq!(out.envelope.source.r#type, "docx");
     assert!(out.envelope.writable);
     // Empty patch reproduces the container exactly.
-    let same = reconstruct(
+    let same = write(
         &out.envelope,
         out.idmap.as_ref().unwrap(),
         &docx,
@@ -363,7 +363,7 @@ fn docx_edit_is_surgical_and_repackages() {
             },
         ],
     };
-    let new_docx = reconstruct(&out.envelope, idmap, &docx, &patch).unwrap();
+    let new_docx = write(&out.envelope, idmap, &docx, &patch).unwrap();
 
     // The edited part changed as intended...
     let doc = read_docx_part(&new_docx, "word/document.xml");
@@ -420,7 +420,7 @@ fn xlsx_edits_shared_strings() {
             value: "Area".to_string(),
         }],
     };
-    let new = reconstruct(&out.envelope, idmap, &xlsx, &patch).unwrap();
+    let new = write(&out.envelope, idmap, &xlsx, &patch).unwrap();
     let s = read_docx_part(&new, "xl/sharedStrings.xml");
     assert!(s.contains("<t>Area</t>"));
     assert!(s.contains("<t>APAC</t>"));
@@ -472,7 +472,7 @@ fn pptx_edits_multiple_slides_atomically() {
             },
         ],
     };
-    let new = reconstruct(&out.envelope, idmap, &pptx, &patch).unwrap();
+    let new = write(&out.envelope, idmap, &pptx, &patch).unwrap();
     assert!(read_docx_part(&new, "ppt/slides/slide1.xml").contains("<a:t>Opening</a:t>"));
     assert!(read_docx_part(&new, "ppt/slides/slide2.xml").contains("<a:t>Closing</a:t>"));
     // The rels part (not selected) is preserved.
@@ -509,7 +509,7 @@ fn docx_merges_runs_and_preserves_untouched_run() {
             value: "Hello brave world".to_string(),
         }],
     };
-    let new = reconstruct(&out.envelope, idmap, &docx, &patch).unwrap();
+    let new = write(&out.envelope, idmap, &docx, &patch).unwrap();
     let d = read_docx_part(&new, "word/document.xml");
 
     // The untouched bold run is preserved byte-for-byte...
@@ -552,7 +552,7 @@ fn pptx_cross_part_patch_aborts_atomically() {
             },
         ],
     };
-    assert!(reconstruct(&out.envelope, idmap, &pptx, &patch).is_err());
+    assert!(write(&out.envelope, idmap, &pptx, &patch).is_err());
 }
 
 #[test]
@@ -579,7 +579,7 @@ fn xlsx_edits_worksheet_cell_value() {
             value: "43".to_string(),
         }],
     };
-    let new = reconstruct(&out.envelope, idmap, &xlsx, &patch).unwrap();
+    let new = write(&out.envelope, idmap, &xlsx, &patch).unwrap();
     assert!(read_docx_part(&new, "xl/worksheets/sheet1.xml").contains("<v>43</v>"));
     // sharedStrings untouched.
     assert_eq!(read_docx_part(&new, "xl/sharedStrings.xml"), shared);
@@ -619,7 +619,7 @@ fn drawio_compressed_diagram_edits_and_reencodes() {
             value: "Begin".to_string(),
         }],
     };
-    let new = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap();
+    let new = write(&out.envelope, idmap, bytes, &patch).unwrap();
     let s = String::from_utf8(new.clone()).unwrap();
     // Outer mxfile structure preserved.
     assert!(s.starts_with(r#"<mxfile host="app">"#));
@@ -687,7 +687,7 @@ fn drawio_untouched_diagram_blob_is_preserved() {
             value: "Started".to_string(),
         }],
     };
-    let new = reconstruct(&out.envelope, idmap, bytes, &patch).unwrap();
+    let new = write(&out.envelope, idmap, bytes, &patch).unwrap();
     let s = String::from_utf8(new).unwrap();
     // The second, untouched diagram keeps its exact original blob.
     assert!(
@@ -769,7 +769,7 @@ fn pdf_text_edit_preserves_other_text() {
             },
         ],
     };
-    let new = reconstruct(&out.envelope, idmap, &pdf, &patch).unwrap();
+    let new = write(&out.envelope, idmap, &pdf, &patch).unwrap();
 
     // Re-extract the rebuilt PDF: the edit landed, the other string is intact.
     let out2 = extract("doc.pdf", &new).unwrap();
@@ -794,7 +794,7 @@ fn pdf_stale_guard_aborts() {
             },
         ],
     };
-    assert!(reconstruct(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
+    assert!(write(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
 }
 
 #[test]
@@ -807,5 +807,5 @@ fn pdf_rejects_structural_ops() {
             path: format!("/structure/{id}"),
         }],
     };
-    assert!(reconstruct(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
+    assert!(write(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
 }
