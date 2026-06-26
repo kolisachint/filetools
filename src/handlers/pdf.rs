@@ -130,9 +130,21 @@ impl super::Handler for PdfHandler {
         let mut doc = Document::load_mem(bytes).context("parsing PDF")?;
         let pages = ordered_pages(&doc);
 
-        // Guard + existence checks against current text (read pass) before any
-        // mutation, so a stale guard aborts atomically.
-        let current = current_text(&doc, &pages)?;
+        // Decode each page's content once; reuse for the guard pass and the
+        // mutation pass.
+        let mut decoded: Vec<(ObjectId, Content)> = Vec::with_capacity(pages.len());
+        for pid in &pages {
+            decoded.push((*pid, doc.get_and_decode_page_content(*pid)?));
+        }
+
+        // Guard + existence checks against current text before any mutation, so
+        // a stale guard aborts atomically (the document is never saved on error).
+        let mut current: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for (pi, (_pid, content)) in decoded.iter_mut().enumerate() {
+            for_each_string(content, |ti, s| {
+                current.insert(format!("pdf_p{pi}_t{ti}"), s.clone());
+            });
+        }
         for (id, hash) in &guards {
             let cur = current
                 .get(id)
@@ -151,10 +163,9 @@ impl super::Handler for PdfHandler {
         }
 
         // Mutate each page's content and re-point /Contents at a fresh stream.
-        for (pi, pid) in pages.iter().enumerate() {
-            let mut content = doc.get_and_decode_page_content(*pid)?;
+        for (pi, (pid, content)) in decoded.iter_mut().enumerate() {
             let mut changed = false;
-            for_each_string(&mut content, |ti, s| {
+            for_each_string(content, |ti, s| {
                 if let Some(nv) = repl.get(&format!("pdf_p{pi}_t{ti}")) {
                     *s = nv.clone();
                     changed = true;
@@ -214,18 +225,6 @@ fn for_each_string<F: FnMut(usize, &mut Vec<u8>)>(content: &mut Content, mut f: 
             _ => {}
         }
     }
-}
-
-/// Build the current id -> string-bytes map (read-only pass).
-fn current_text(doc: &Document, pages: &[ObjectId]) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut out = BTreeMap::new();
-    for (pi, pid) in pages.iter().enumerate() {
-        let mut content = doc.get_and_decode_page_content(*pid)?;
-        for_each_string(&mut content, |ti, s| {
-            out.insert(format!("pdf_p{pi}_t{ti}"), s.clone());
-        });
-    }
-    Ok(out)
 }
 
 /// `/structure/<id>` or `/structure/<id>/...` -> `<id>`.

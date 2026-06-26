@@ -242,8 +242,15 @@ fn encode_diagram(inner: &[u8], compressed: bool) -> Vec<u8> {
 
 /// Decompress a drawio diagram blob: `base64(deflateRaw(encodeURIComponent(xml)))`.
 pub fn decompress_diagram(blob: &[u8]) -> Result<Vec<u8>> {
+    // Some tools line-wrap the base64; the standard engine rejects whitespace,
+    // so strip it first.
+    let compact: Vec<u8> = blob
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
     let raw = base64::engine::general_purpose::STANDARD
-        .decode(blob)
+        .decode(&compact)
         .context("base64 decode")?;
     let mut inflated = Vec::new();
     DeflateDecoder::new(&raw[..])

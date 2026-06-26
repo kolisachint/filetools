@@ -630,6 +630,20 @@ fn drawio_compressed_diagram_edits_and_reencodes() {
 }
 
 #[test]
+fn drawio_decompresses_line_wrapped_base64() {
+    // Some tools line-wrap the base64 blob; decoding must tolerate whitespace.
+    let blob = compress_diagram(MODEL_A.as_bytes());
+    let wrapped: String = blob
+        .as_bytes()
+        .chunks(40)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let back = decompress_diagram(wrapped.as_bytes()).unwrap();
+    assert_eq!(back, MODEL_A.as_bytes());
+}
+
+#[test]
 fn drawio_diagram_tag_with_gt_in_attribute() {
     // A `>` inside the diagram's name attribute must not be mistaken for the
     // end of the open tag.
