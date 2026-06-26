@@ -121,3 +121,65 @@ jobs:
           else
             gh release create "$tag" --title "$tag" --generate-notes
           fi
+
+  # ── 4. Cross-platform binary builds ───────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [create-release, bump-and-tag]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: filetools
+          target: ${{ matrix.target }}
+          archive: filetools-$target
+          checksum: sha256
+          ref: refs/tags/${{ needs.bump-and-tag.outputs.tag }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 5. Aggregate SHA256SUMS ───────────────────────────────────────────
+  checksums:
+    name: Aggregate SHA256SUMS
+    needs: [build, bump-and-tag]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build SHA256SUMS from per-asset checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.bump-and-tag.outputs.tag }}"
+          mkdir sums && cd sums
+          gh release download "$tag" --pattern '*.sha256' --dir .
+          : > SHA256SUMS
+          for f in *.sha256; do
+            awk '{ n = $2; sub(/.*\//, "", n); print $1 "  " n }' "$f" >> SHA256SUMS
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          echo "==== SHA256SUMS ===="; cat SHA256SUMS
+          gh release upload "$tag" SHA256SUMS --clobber
