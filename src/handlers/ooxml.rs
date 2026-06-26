@@ -215,9 +215,10 @@ impl super::Handler for OoxmlHandler {
 ///
 /// For every element tagged `para`, gather its descendant `run` text elements
 /// in document order, set the paragraph's `text` to their concatenation, hide
-/// the runs (clear children), and record the runs' inner spans on the
+/// the runs (remove run children), and record the runs' inner spans on the
 /// paragraph's id-map entry so a later text-replace can rewrite only the runs
 /// that changed. The now-hidden descendant nodes are dropped from the id-map.
+/// Non-run children (like w:pPr for paragraph properties) are preserved.
 fn merge_runs(nodes: &mut [DocNode], idmap: &mut IdMap, para: &str, run: &str) {
     for node in nodes.iter_mut() {
         if node.tag == para {
@@ -230,10 +231,11 @@ fn merge_runs(nodes: &mut [DocNode], idmap: &mut IdMap, para: &str, run: &str) {
                     loc.inner = None;
                     loc.runs = Some(spans);
                 }
-                for d in dead {
-                    idmap.map.remove(&d);
+                for d in &dead {
+                    idmap.map.remove(d);
                 }
-                node.children.clear();
+                // Remove run children (w:r), but preserve paragraph properties (w:pPr)
+                node.children.retain(|c| c.tag != "w:r" && c.tag != "a:r");
                 node.text = Some(text);
             } else {
                 // A paragraph with no text runs (e.g. image-only) stays generic.

@@ -6,20 +6,125 @@
 
 Code:
 
-- `src/lib.rs` — library root: `extract`, `reconstruct`, `patch` public API
+- `src/lib.rs` — library root: `scan`, `read`, `edit`, `write` public API
 - `src/bin/filetools.rs` — CLI entry point (clap-based)
-- `src/model.rs` — data model (envelope, id-map, patch types)
+- `src/model.rs` — data model (envelope, id-map, patch types, scan result)
 - `src/idmap.rs` — sidecar id-map: content-addressed byte-span tracking
 - `src/patch.rs` — RFC-6902-style patch application
+- `src/cache.rs` — bounded LRU used by the in-process scan/extract caches
 - `src/handlers/mod.rs` — handler registry
 - `src/handlers/xml.rs` — generic XML (lossless byte-splice)
 - `src/handlers/ooxml.rs` — OOXML: docx, xlsx, pptx
+- `src/handlers/xlsx.rs` — hierarchical XLSX scan + lazy row-range read
 - `src/handlers/drawio.rs` — drawio (compressed/uncompressed)
 - `src/handlers/pdf.rs` — PDF text replacement
+- `src/handlers/html.rs` — HTML span-tracking tokenizer + surgical text edits
+- `src/handlers/csv.rs` — CSV cell-addressable, byte-faithful field edits
+- `src/handlers/optimized.rs` — lightweight manifest scanners (pptx, pdf, svg,
+  drawio, markdown, mermaid, csv, html, zip, image metadata)
 - `src/handlers/readonly.rs` — read-only fallback for unknown binaries
 - `tests/roundtrip.rs` — integration tests
+- `tests/scan_formats.rs` — scan-level tests for lightweight handlers
+- `tests/edit_formats.rs` — CSV/HTML edit/write round-trip tests
 - `.github/workflows/` — `ci.yml`, `release.yml`
 - `.agents/commands/` — slash-command definitions (`pr.md`)
+
+## API Layers
+
+filetools exposes two workflows: a manifest-first path for token-sensitive agent loops, and a full-content path for batch operations.
+
+### Manifest-First Workflow (Agent-Optimized)
+
+Use this when the caller needs to select specific blocks before loading content.
+
+```rust
+// 1. Get lightweight manifest (no content hydrated)
+pub fn scan(file: &File) -> Result<ScanResult>
+
+// 2. Select block IDs from manifest, then hydrate only those
+pub fn read(file: &File, ids: &[String]) -> Result<Vec<Block>>
+
+// 3. Apply edits with optional staleness guard
+pub fn edit(doc: &mut DocEnvelope, ops: &[Patch]) -> Result<()>
+
+// 4. Write back to file
+pub fn write(doc: &DocEnvelope, target: &Path) -> Result<()>
+```
+
+### Full-Content Workflow (Batch)
+
+Use this when the caller needs the entire document hydrated.
+
+```rust
+// Load everything at once
+pub fn parse(file: &File) -> Result<DocEnvelope>  // alias for read with empty ids
+pub fn edit(doc: &mut DocEnvelope, ops: &[Patch]) -> Result<()>
+pub fn write(doc: &DocEnvelope, target: &Path) -> Result<()>
+```
+
+### Data Structures
+
+**ScanResult** — returned by `scan()`, contains document metadata without content:
+
+```rust
+pub struct ScanResult {
+    pub file_type: FileType,
+    pub block_count: usize,
+    pub total_tokens: usize,
+    pub blocks: Vec<BlockManifest>,
+}
+```
+
+**BlockManifest** — per-block metadata for selection:
+
+```rust
+pub struct BlockManifest {
+    pub id: String,              // Structural path: section[2].table[0].row[3]
+    pub block_type: BlockType,   // Heading, Paragraph, Table, List, Code, Image, Cell
+    pub preview: String,         // First ~100 chars for disambiguation
+    pub content_hash: String,    // Staleness guard
+    pub parent_id: Option<String>,
+    pub token_estimate: usize,
+    pub section_name: String,
+    pub section_number: usize,
+}
+```
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Block ID scheme | Structural path | Stable across non-destructive edits |
+| Manifest fields | All (id, type, preview, hash, parent, tokens, name, number) | Self-describing, cheap to compute |
+| DocScan output | No file_name | Caller already has the path |
+| DocRead options | IDs only | Neighbors can be added later |
+| Patch guard | Optional `expected: Option<String>` | Skip check when safe, enforce when needed |
+| Manifest persistence | In-memory cache (HashMap) | Fast for single-session, no file pollution |
+| First format | DOCX | Most common binary target |
+
+### Block ID Scheme
+
+Block IDs are structural paths derived from document hierarchy:
+
+- `section[0]` — first section
+- `section[0].paragraph[1]` — second paragraph in first section
+- `section[2].table[0].row[3]` — fourth row of first table in third section
+
+Content hash is stored separately as `content_hash` for staleness detection, not as the identity.
+
+### Patch Operations
+
+Patches reference blocks by ID with optional staleness guard:
+
+```rust
+pub struct Replace {
+    pub id: String,
+    pub expected: Option<String>,  // None = skip staleness check
+    pub replacement: String,
+}
+```
+
+The `expected` field, when present, must match the block's `content_hash` or the patch fails. This prevents blind overwrites when the underlying block changed between scan and edit.
 
 ## Conversational Style
 

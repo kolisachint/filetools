@@ -147,7 +147,7 @@ fn cmd_reconstruct(
     let patch: Patch = serde_json::from_slice(&fs::read(patch)?)
         .with_context(|| format!("parsing patch {}", patch.display()))?;
 
-    let result = filetools_rs::reconstruct(&env, &idmap, &original, &patch)?;
+    let result = filetools_rs::write(&env, &idmap, &original, &patch)?;
     fs::write(out, &result).with_context(|| format!("writing {}", out.display()))?;
     eprintln!(
         "reconstructed {} -> {} ({} ops, {} bytes)",

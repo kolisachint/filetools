@@ -1,9 +1,13 @@
 //! Format handlers and dispatch.
 
+pub mod csv;
 pub mod drawio;
+pub mod html;
 pub mod ooxml;
+pub mod optimized;
 pub mod pdf;
 pub mod readonly;
+pub mod xlsx;
 pub mod xml;
 
 use crate::idmap::{verify_spans, IdMap};
@@ -48,6 +52,8 @@ pub fn for_path(path: &str, bytes: &[u8]) -> Box<dyn Handler> {
         "pptx" => Box::new(ooxml::pptx()),
         "pdf" => Box::new(pdf::PdfHandler),
         "drawio" | "dio" => Box::new(drawio::DrawioHandler),
+        "html" | "htm" => Box::new(html::HtmlHandler),
+        "csv" => Box::new(csv::CsvHandler),
         "xml" | "svg" | "xhtml" => Box::new(xml::XmlHandler),
         _ => {
             if looks_like_xml(bytes) {
@@ -68,6 +74,8 @@ pub fn for_type(type_name: &str) -> Option<Box<dyn Handler>> {
         "pptx" => Some(Box::new(ooxml::pptx())),
         "pdf" => Some(Box::new(pdf::PdfHandler)),
         "drawio" => Some(Box::new(drawio::DrawioHandler)),
+        "html" => Some(Box::new(html::HtmlHandler)),
+        "csv" => Some(Box::new(csv::CsvHandler)),
         "xml" => Some(Box::new(xml::XmlHandler)),
         "binary" => Some(Box::new(readonly::ReadOnlyHandler)),
         _ => None,
