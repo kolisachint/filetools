@@ -3,6 +3,12 @@
 //!   # extract -> envelope JSON (+ sidecar id-map next to it)
 //!   filetools extract --input report.xml --out report.ft.json
 //!
+//!   # scan -> lightweight, paginated manifest to stdout (pick ids first)
+//!   filetools scan --input big.xlsx --offset 0 --limit 100
+//!
+//!   # read -> hydrate only the blocks you selected (also paginated)
+//!   filetools read --input big.xlsx --id 'sheet[0].rows[0-99]'
+//!
 //!   # reconstruct: apply a patch back into the original format
 //!   filetools reconstruct --envelope report.ft.json --patch patch.json \
 //!                         --out report_v2.xml
@@ -17,8 +23,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use filetools_rs::idmap::IdMap;
-use filetools_rs::model::Envelope;
+use filetools_rs::model::{BlockManifest, Envelope};
 use filetools_rs::patch::Patch;
+use serde::Serialize;
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +49,37 @@ enum Cmd {
         /// Strip ids and skip the sidecar — analysis-only, max token savings.
         #[arg(long)]
         readonly: bool,
+    },
+    /// Print a lightweight manifest (no content hydrated) as JSON to stdout.
+    ///
+    /// Use this to pick block ids before hydrating them with `read`.
+    Scan {
+        #[arg(long)]
+        input: PathBuf,
+        /// Skip the first N blocks.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Return at most N blocks. 0 means no limit.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+    /// Hydrate specific blocks by id and print them as JSON to stdout.
+    ///
+    /// Scope with `--id` (repeatable). With no ids, every block is returned;
+    /// use `--offset`/`--limit` to page through a dense file.
+    Read {
+        #[arg(long)]
+        input: PathBuf,
+        /// Block id to hydrate. Repeat to request several. Accepts structural
+        /// paths, `part:<name>` markers, and xlsx `sheet[n].rows[a-b]` ranges.
+        #[arg(long = "id")]
+        ids: Vec<String>,
+        /// Skip the first N blocks of the result.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Return at most N blocks. 0 means no limit.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// Apply a patch to the original and write the reconstructed file.
     Reconstruct {
@@ -67,6 +105,17 @@ fn main() -> Result<()> {
             out,
             readonly,
         } => cmd_extract(&input, out.as_deref(), readonly),
+        Cmd::Scan {
+            input,
+            offset,
+            limit,
+        } => cmd_scan(&input, offset, limit),
+        Cmd::Read {
+            input,
+            ids,
+            offset,
+            limit,
+        } => cmd_read(&input, &ids, offset, limit),
         Cmd::Reconstruct {
             envelope,
             patch,
@@ -117,6 +166,106 @@ fn cmd_extract(input: &Path, out: Option<&Path>, readonly: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cmd_scan(input: &Path, offset: usize, limit: usize) -> Result<()> {
+    let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let path_str = input.to_string_lossy();
+    let result = filetools_rs::scan(&path_str, &bytes)?;
+
+    let total = result.blocks.len();
+    let blocks = paginate(result.blocks, offset, limit);
+    let returned = blocks.len();
+
+    let view = ScanView {
+        file_type: result.file_type,
+        block_count: result.block_count,
+        total_tokens: result.total_tokens,
+        offset,
+        returned,
+        total,
+        blocks,
+    };
+    print_json(&view)?;
+    eprintln!(
+        "scanned {} [{:?}, {} blocks, returned {}/{} from offset {}]",
+        input.display(),
+        view.file_type,
+        view.block_count,
+        returned,
+        total,
+        offset,
+    );
+    Ok(())
+}
+
+fn cmd_read(input: &Path, ids: &[String], offset: usize, limit: usize) -> Result<()> {
+    let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let path_str = input.to_string_lossy();
+    let nodes = filetools_rs::read(&path_str, &bytes, ids)?;
+
+    let total = nodes.len();
+    let nodes = paginate(nodes, offset, limit);
+    let returned = nodes.len();
+
+    let view = ReadView {
+        offset,
+        returned,
+        total,
+        nodes,
+    };
+    print_json(&view)?;
+    eprintln!(
+        "read {} [{} ids requested, returned {}/{} from offset {}]",
+        input.display(),
+        ids.len(),
+        returned,
+        total,
+        offset,
+    );
+    Ok(())
+}
+
+/// Apply `offset`/`limit` paging to a vector. `limit == 0` means no cap.
+fn paginate<T>(items: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
+    let mut it = items.into_iter().skip(offset);
+    if limit == 0 {
+        it.collect()
+    } else {
+        it.by_ref().take(limit).collect()
+    }
+}
+
+/// Serialize `value` as pretty JSON to stdout.
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Paginated manifest view printed by `scan`.
+#[derive(Serialize)]
+struct ScanView {
+    file_type: filetools_rs::model::FileType,
+    /// Total blocks in the document (before paging).
+    block_count: usize,
+    total_tokens: usize,
+    /// Paging cursor used for this response.
+    offset: usize,
+    /// Number of blocks in `blocks`.
+    returned: usize,
+    /// Total blocks available to page through.
+    total: usize,
+    blocks: Vec<BlockManifest>,
+}
+
+/// Paginated hydration view printed by `read`.
+#[derive(Serialize)]
+struct ReadView {
+    offset: usize,
+    returned: usize,
+    total: usize,
+    nodes: Vec<filetools_rs::model::DocNode>,
 }
 
 fn cmd_reconstruct(
