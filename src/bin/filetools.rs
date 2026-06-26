@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use filetools::idmap::IdMap;
-use filetools::model::Envelope;
-use filetools::patch::Patch;
+use filetools_rs::idmap::IdMap;
+use filetools_rs::model::Envelope;
+use filetools_rs::patch::Patch;
 
 #[derive(Parser)]
 #[command(
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
 fn cmd_extract(input: &Path, out: Option<&Path>, readonly: bool) -> Result<()> {
     let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let path_str = input.to_string_lossy();
-    let mut output = filetools::extract(&path_str, &bytes)?;
+    let mut output = filetools_rs::extract(&path_str, &bytes)?;
 
     let envelope_path = out
         .map(Path::to_path_buf)
@@ -147,7 +147,7 @@ fn cmd_reconstruct(
     let patch: Patch = serde_json::from_slice(&fs::read(patch)?)
         .with_context(|| format!("parsing patch {}", patch.display()))?;
 
-    let result = filetools::reconstruct(&env, &idmap, &original, &patch)?;
+    let result = filetools_rs::reconstruct(&env, &idmap, &original, &patch)?;
     fs::write(out, &result).with_context(|| format!("writing {}", out.display()))?;
     eprintln!(
         "reconstructed {} -> {} ({} ops, {} bytes)",
@@ -160,7 +160,7 @@ fn cmd_reconstruct(
 }
 
 fn strip_ids(env: &mut Envelope) {
-    fn walk(nodes: &mut [filetools::model::DocNode]) {
+    fn walk(nodes: &mut [filetools_rs::model::DocNode]) {
         for n in nodes {
             n.id.clear();
             walk(&mut n.children);

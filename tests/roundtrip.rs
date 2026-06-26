@@ -1,8 +1,8 @@
 //! End-to-end tests for extract -> patch -> reconstruct.
 
-use filetools::model::Attr;
-use filetools::patch::{NewElement, Op, Patch};
-use filetools::{extract, reconstruct};
+use filetools_rs::model::Attr;
+use filetools_rs::patch::{NewElement, Op, Patch};
+use filetools_rs::{extract, reconstruct};
 
 const SAMPLE: &str = r#"<?xml version="1.0"?>
 <doc>
@@ -16,8 +16,8 @@ const SAMPLE: &str = r#"<?xml version="1.0"?>
 "#;
 
 /// Find the id of the first node whose text equals `needle`.
-fn id_with_text(env: &filetools::model::Envelope, needle: &str) -> String {
-    fn walk(nodes: &[filetools::model::DocNode], needle: &str) -> Option<String> {
+fn id_with_text(env: &filetools_rs::model::Envelope, needle: &str) -> String {
+    fn walk(nodes: &[filetools_rs::model::DocNode], needle: &str) -> Option<String> {
         for n in nodes {
             if n.text.as_deref() == Some(needle) {
                 return Some(n.id.clone());
@@ -33,13 +33,13 @@ fn id_with_text(env: &filetools::model::Envelope, needle: &str) -> String {
 
 /// Find the first node (at any depth) with the given tag.
 fn node_with_tag<'a>(
-    env: &'a filetools::model::Envelope,
+    env: &'a filetools_rs::model::Envelope,
     tag: &str,
-) -> &'a filetools::model::DocNode {
+) -> &'a filetools_rs::model::DocNode {
     fn walk<'a>(
-        nodes: &'a [filetools::model::DocNode],
+        nodes: &'a [filetools_rs::model::DocNode],
         tag: &str,
-    ) -> Option<&'a filetools::model::DocNode> {
+    ) -> Option<&'a filetools_rs::model::DocNode> {
         for n in nodes {
             if n.tag == tag {
                 return Some(n);
@@ -53,8 +53,8 @@ fn node_with_tag<'a>(
     walk(&env.structure, tag).expect("node with tag not found")
 }
 
-fn id_with_attr(env: &filetools::model::Envelope, name: &str, value: &str) -> String {
-    fn walk(nodes: &[filetools::model::DocNode], name: &str, value: &str) -> Option<String> {
+fn id_with_attr(env: &filetools_rs::model::Envelope, name: &str, value: &str) -> String {
+    fn walk(nodes: &[filetools_rs::model::DocNode], name: &str, value: &str) -> Option<String> {
         for n in nodes {
             if n.attrs.iter().any(|a| a.name == name && a.value == value) {
                 return Some(n.id.clone());
@@ -587,7 +587,7 @@ fn xlsx_edits_worksheet_cell_value() {
 
 // --- drawio compression -----------------------------------------------------
 
-use filetools::handlers::drawio::{compress_diagram, decompress_diagram};
+use filetools_rs::handlers::drawio::{compress_diagram, decompress_diagram};
 
 const MODEL_A: &str =
     r#"<mxGraphModel><root><mxCell id="2" value="Start" vertex="1"/></root></mxGraphModel>"#;
@@ -751,7 +751,7 @@ fn pdf_text_edit_preserves_other_text() {
     assert_eq!(out.envelope.source.r#type, "pdf");
     assert_eq!(
         out.envelope.fidelity,
-        filetools::model::Fidelity::InPlaceText
+        filetools_rs::model::Fidelity::InPlaceText
     );
 
     let idmap = out.idmap.as_ref().unwrap();
