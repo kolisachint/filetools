@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use filetools_rs::idmap::IdMap;
-use filetools_rs::model::{BlockManifest, Envelope};
+use filetools_rs::model::{BlockManifest, Envelope, GrepMatch, GrepOptions};
 use filetools_rs::patch::Patch;
 use serde::Serialize;
 
@@ -81,6 +81,24 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// Search block text for a pattern and print matching ids as JSON.
+    ///
+    /// The discovery counterpart to `read`: locate the blocks you care about
+    /// without hydrating the whole document, then feed the ids into `read` or
+    /// `reconstruct`.
+    Grep {
+        #[arg(long)]
+        input: PathBuf,
+        /// Literal substring to search for (matched per line of block text).
+        #[arg(long)]
+        pattern: String,
+        /// Case-insensitive matching.
+        #[arg(long, default_value_t = false)]
+        ignore_case: bool,
+        /// Stop after N matches. 0 means no limit.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
     /// Apply a patch to the original and write the reconstructed file.
     Reconstruct {
         /// The envelope produced by `extract`.
@@ -116,6 +134,12 @@ fn main() -> Result<()> {
             offset,
             limit,
         } => cmd_read(&input, &ids, offset, limit),
+        Cmd::Grep {
+            input,
+            pattern,
+            ignore_case,
+            limit,
+        } => cmd_grep(&input, &pattern, ignore_case, limit),
         Cmd::Reconstruct {
             envelope,
             patch,
@@ -226,6 +250,30 @@ fn cmd_read(input: &Path, ids: &[String], offset: usize, limit: usize) -> Result
     Ok(())
 }
 
+fn cmd_grep(input: &Path, pattern: &str, ignore_case: bool, limit: usize) -> Result<()> {
+    let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let path_str = input.to_string_lossy();
+    let opts = GrepOptions {
+        ignore_case,
+        limit: (limit > 0).then_some(limit),
+    };
+    let matches = filetools_rs::grep(&path_str, &bytes, pattern, &opts)?;
+
+    let view = GrepView {
+        pattern: pattern.to_string(),
+        returned: matches.len(),
+        matches,
+    };
+    print_json(&view)?;
+    eprintln!(
+        "grep {} [pattern {:?}, {} matches]",
+        input.display(),
+        pattern,
+        view.returned,
+    );
+    Ok(())
+}
+
 /// Apply `offset`/`limit` paging to a vector. `limit == 0` means no cap.
 fn paginate<T>(items: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     let mut it = items.into_iter().skip(offset);
@@ -266,6 +314,14 @@ struct ReadView {
     returned: usize,
     total: usize,
     nodes: Vec<filetools_rs::model::DocNode>,
+}
+
+/// Match list printed by `grep`.
+#[derive(Serialize)]
+struct GrepView {
+    pattern: String,
+    returned: usize,
+    matches: Vec<GrepMatch>,
 }
 
 fn cmd_reconstruct(

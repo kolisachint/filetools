@@ -26,7 +26,8 @@ use anyhow::{bail, Context, Result};
 
 use idmap::{sha256_hex, IdMap};
 use model::{
-    Attr, BlockManifest, BlockType, DocNode, Envelope, Fidelity, FileType, ScanResult, Source,
+    Attr, BlockManifest, BlockType, DocNode, Envelope, Fidelity, FileType, GrepMatch, GrepOptions,
+    ScanResult, Source,
 };
 use patch::Patch;
 
@@ -825,6 +826,76 @@ pub fn read(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
     Ok(result)
 }
 
+/// Search a file's text content for `needle`, returning the ids of matching
+/// blocks plus a line/snippet for context.
+///
+/// This is the discovery counterpart to `read`: instead of hydrating every
+/// block to find the interesting ones (token-expensive), `grep` walks the same
+/// block tree `read` produces and returns only `GrepMatch`es. Each `block_id`
+/// resolves directly via `read`/`reconstruct`, so a caller funnels matches
+/// straight into an edit. `writable` flags whether the format can be patched.
+///
+/// `needle` is matched as a literal substring (per line of a block's text).
+pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions) -> Result<Vec<GrepMatch>> {
+    let nodes = read(path, bytes, &[])?;
+    let writable = is_writable_format(path, bytes);
+
+    let hay_needle = if opts.ignore_case {
+        needle.to_lowercase()
+    } else {
+        needle.to_string()
+    };
+
+    let mut matches = Vec::new();
+    grep_walk(&nodes, &hay_needle, opts, writable, &mut matches);
+    Ok(matches)
+}
+
+/// Recursively scan `nodes`, pushing a `GrepMatch` per matching line of each
+/// node's direct text. Honors `opts.limit` (stops once reached).
+fn grep_walk(
+    nodes: &[DocNode],
+    needle: &str,
+    opts: &GrepOptions,
+    writable: bool,
+    out: &mut Vec<GrepMatch>,
+) {
+    for node in nodes {
+        if let Some(limit) = opts.limit {
+            if out.len() >= limit {
+                return;
+            }
+        }
+        if let Some(text) = &node.text {
+            for (i, line) in text.lines().enumerate() {
+                let hay = if opts.ignore_case {
+                    line.to_lowercase()
+                } else {
+                    line.to_string()
+                };
+                if hay.contains(needle) {
+                    out.push(GrepMatch {
+                        block_id: node.id.clone(),
+                        line: i + 1,
+                        snippet: truncate_ellipsis(line.trim(), 120),
+                        writable,
+                    });
+                    if opts.limit.is_some_and(|l| out.len() >= l) {
+                        return;
+                    }
+                }
+            }
+        }
+        grep_walk(&node.children, needle, opts, writable, out);
+    }
+}
+
+/// Whether a path's format can be edited and reconstructed (has a non-read-only
+/// handler). Cheap: inspects the handler's declared fidelity, no extraction.
+fn is_writable_format(path: &str, bytes: &[u8]) -> bool {
+    handlers::for_path(path, bytes).fidelity() != Fidelity::ReadOnly
+}
+
 /// Return the optimized block tree for formats that have a dedicated scan
 /// handler, or `None` for formats that should use generic extraction.
 ///
@@ -973,9 +1044,10 @@ pub fn edit(envelope: &Envelope, idmap: &IdMap, original: &[u8], patch: &Patch) 
 
 /// Apply a patch to the original and return the reconstructed bytes.
 ///
-/// Verifies the original still matches the hash the envelope was extracted from
-/// (fails loud on drift), refuses non-writable envelopes, and confirms the
-/// sidecar belongs to this original before splicing.
+/// Refuses non-writable envelopes and confirms the sidecar belongs to this
+/// original before splicing. When the original still matches the extract hash
+/// this splices directly; when it has drifted (an out-of-band rewrite) it hands
+/// off to `reconstruct_drifted` for autonomous, fingerprint-based recovery.
 fn reconstruct(
     envelope: &Envelope,
     idmap: &IdMap,
@@ -990,11 +1062,10 @@ fn reconstruct(
     }
     let actual = sha256_hex(original);
     if actual != envelope.source.hash {
-        bail!(
-            "original has drifted since extract: envelope expected {}, file is {}",
-            envelope.source.hash,
-            actual
-        );
+        // The original was rewritten out-of-band (e.g. openpyxl) since extract.
+        // Autonomously recover: re-extract the current bytes and re-target the
+        // patch by content fingerprint, then apply against the fresh id-map.
+        return reconstruct_drifted(envelope, idmap, original, patch);
     }
     if idmap.for_hash != envelope.source.hash {
         bail!("sidecar id-map does not match this original (hash mismatch)");
@@ -1002,6 +1073,232 @@ fn reconstruct(
     let handler = handlers::for_type(&envelope.source.r#type)
         .with_context(|| format!("no handler for type `{}`", envelope.source.r#type))?;
     handler.reconstruct(original, idmap, patch)
+}
+
+/// A *semantic* content fingerprint for a patch target: its own normalized
+/// text signature plus its parent's. Parent-anchoring disambiguates the common
+/// case of repeated content (identical cells/paragraphs) so a re-target lands
+/// on the node the patch *meant*, not merely one that looks the same.
+///
+/// Unlike a byte hash, the signature survives whitespace reflow, attribute
+/// reordering, entity reencoding, and wholesale serializer rewrites (e.g.
+/// openpyxl re-emitting an xlsx) — because it keys on the preserved *value*,
+/// not the exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Fingerprint {
+    signature: String,
+    parent_signature: Option<String>,
+}
+
+/// Collapse whitespace runs to single spaces and trim, so reflow/reindent and
+/// entity differences don't change a node's text identity.
+fn normalize_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Depth-first, document-order concatenation of a node's own and descendant
+/// text. Container nodes (no own text) are identified by the text they enclose.
+fn collect_text(node: &DocNode, out: &mut String) {
+    if let Some(t) = &node.text {
+        out.push_str(t);
+        out.push(' ');
+    }
+    for c in &node.children {
+        collect_text(c, out);
+    }
+}
+
+/// Semantic signature of a node: its tag plus its normalized descendant text.
+/// The tag guards against a text-equal node of a different kind colliding.
+fn node_signature(node: &DocNode) -> String {
+    let mut text = String::new();
+    collect_text(node, &mut text);
+    // U+001F (unit separator) cannot appear in a tag, so it cleanly delimits.
+    format!("{}\u{1f}{}", node.tag, normalize_text(&text))
+}
+
+/// Fingerprint every node in a structure tree (id -> semantic fingerprint).
+fn fingerprint_tree(structure: &[DocNode]) -> HashMap<String, Fingerprint> {
+    fn walk(nodes: &[DocNode], parent_sig: Option<&str>, out: &mut HashMap<String, Fingerprint>) {
+        for node in nodes {
+            let sig = node_signature(node);
+            out.insert(
+                node.id.clone(),
+                Fingerprint {
+                    signature: sig.clone(),
+                    parent_signature: parent_sig.map(str::to_string),
+                },
+            );
+            walk(&node.children, Some(&sig), out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(structure, None, &mut out);
+    out
+}
+
+/// Fingerprint every distinct id an `id`-based op references, using the
+/// structure tree the patch was authored against.
+fn fingerprint_targets(
+    structure: &[DocNode],
+    patch: &Patch,
+) -> Result<HashMap<String, Fingerprint>> {
+    let all = fingerprint_tree(structure);
+    let mut out: HashMap<String, Fingerprint> = HashMap::new();
+    for op in &patch.patch {
+        let Some(id) = op.target_id() else { continue };
+        if out.contains_key(id) {
+            continue;
+        }
+        let fp = all.get(id).with_context(|| {
+            format!("patch references id `{id}` absent from the structure it was authored against")
+        })?;
+        out.insert(id.to_string(), fp.clone());
+    }
+    Ok(out)
+}
+
+/// Build the reverse index from `Fingerprint` to id for a (fresh) structure.
+/// Fingerprints that are not unique map to `None`, so an ambiguous re-target
+/// fails loud instead of editing an arbitrary match.
+fn index_by_fingerprint(structure: &[DocNode]) -> HashMap<Fingerprint, Option<String>> {
+    let mut idx: HashMap<Fingerprint, Option<String>> = HashMap::new();
+    for (id, fp) in fingerprint_tree(structure) {
+        idx.entry(fp)
+            .and_modify(|slot| *slot = None) // collision -> ambiguous
+            .or_insert(Some(id));
+    }
+    idx
+}
+
+/// Rewrite an op's target/anchor id from `old` to `new`.
+fn retarget_op(op: &patch::Op, old: &str, new: &str) -> patch::Op {
+    let swap_path = |path: &str| -> String {
+        match path.strip_prefix("/structure/") {
+            Some(rest) => {
+                let tail = rest
+                    .strip_prefix(old)
+                    .filter(|t| t.is_empty() || t.starts_with('/'));
+                match tail {
+                    Some(t) => format!("/structure/{new}{t}"),
+                    None => path.to_string(),
+                }
+            }
+            None => path.to_string(),
+        }
+    };
+    match op {
+        patch::Op::Test { path, hash } => patch::Op::Test {
+            path: swap_path(path),
+            hash: hash.clone(),
+        },
+        patch::Op::Replace { path, value } => patch::Op::Replace {
+            path: swap_path(path),
+            value: value.clone(),
+        },
+        patch::Op::Remove { path } => patch::Op::Remove {
+            path: swap_path(path),
+        },
+        patch::Op::Add {
+            after,
+            before,
+            value,
+        } => patch::Op::Add {
+            after: after.as_deref().map(|a| {
+                if a == old {
+                    new.to_string()
+                } else {
+                    a.to_string()
+                }
+            }),
+            before: before.as_deref().map(|b| {
+                if b == old {
+                    new.to_string()
+                } else {
+                    b.to_string()
+                }
+            }),
+            value: value.clone(),
+        },
+    }
+}
+
+/// Autonomous drift recovery (Preset B): re-extract the rewritten original,
+/// re-target every op by parent-anchored content fingerprint, and apply the
+/// rewritten patch atomically against the fresh id-map.
+///
+/// Refuses (fails loud, applies nothing) when any target's fingerprint is gone
+/// or ambiguous in the new extract — the only safe response when the content
+/// the patch meant to edit can no longer be located unambiguously.
+fn reconstruct_drifted(
+    envelope: &Envelope,
+    idmap: &IdMap,
+    original: &[u8],
+    patch: &Patch,
+) -> Result<Vec<u8>> {
+    if idmap.for_hash != envelope.source.hash {
+        bail!("sidecar id-map does not match this original (hash mismatch)");
+    }
+
+    // What each op meant, fingerprinted against the OLD structure it was
+    // authored on (semantic text signatures, parent-anchored).
+    let want = fingerprint_targets(&envelope.structure, patch)?;
+
+    // Re-extract the CURRENT bytes and index them by fingerprint.
+    let fresh = extract(&envelope.source.path, original)
+        .context("drift recovery: re-extracting the rewritten original failed")?;
+    let fresh_idmap = fresh
+        .idmap
+        .as_ref()
+        .context("drift recovery: rewritten original is not a writable format")?;
+    let fresh_index = index_by_fingerprint(&fresh.envelope.structure);
+
+    // Resolve old id -> new id, failing loud on any miss or ambiguity.
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (old_id, fp) in &want {
+        match fresh_index.get(fp) {
+            Some(Some(new_id)) => {
+                remap.insert(old_id.clone(), new_id.clone());
+            }
+            Some(None) => bail!(
+                "drift recovery: target `{old_id}` is ambiguous after re-extract \
+                 (its content and parent now match multiple nodes); aborting without edit"
+            ),
+            None => bail!(
+                "drift recovery: target `{old_id}` no longer exists after the original \
+                 was rewritten; aborting without edit"
+            ),
+        }
+    }
+
+    // Signal the autonomous recovery so a caller isn't silently surprised that
+    // re-targeting happened (the file changed out-of-band since extract).
+    eprintln!(
+        "drift recovery: original `{}` was rewritten since extract; \
+         re-targeted {} of {} ops by content fingerprint",
+        envelope.source.path,
+        remap.len(),
+        patch.patch.len(),
+    );
+
+    // Rewrite the patch onto fresh ids and apply atomically.
+    let rewritten = Patch {
+        patch: patch
+            .patch
+            .iter()
+            .map(|op| match op.target_id() {
+                Some(id) => match remap.get(id) {
+                    Some(new) => retarget_op(op, id, new),
+                    None => op.clone(),
+                },
+                None => op.clone(),
+            })
+            .collect(),
+    };
+
+    let handler = handlers::for_type(&fresh.envelope.source.r#type)
+        .with_context(|| format!("no handler for type `{}`", fresh.envelope.source.r#type))?;
+    handler.reconstruct(original, fresh_idmap, &rewritten)
 }
 
 fn file_name(path: &str) -> &str {
