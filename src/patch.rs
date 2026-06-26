@@ -8,6 +8,8 @@
 //!   * `test` carries a content `hash` (not a value) for optimistic guards.
 //!   * Application is atomic: any failed op/guard aborts; original untouched.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::idmap::{IdMap, Span};
@@ -56,6 +58,119 @@ impl Op {
     }
 }
 
+/// The parent/child shape of an id-map, recovered from byte-span nesting.
+///
+/// The id-map stores no explicit parent pointers, but element spans nest
+/// exactly like the source XML, so the smallest span that contains a node is
+/// its parent. `order` lists ids in document order (containing element first).
+struct Tree<'a> {
+    children_of: HashMap<&'a str, Vec<&'a str>>,
+    order: Vec<&'a str>,
+}
+
+/// Recover the containment tree of an id-map via a span stack walk.
+///
+/// Spans are scoped by `part`: OOXML stores one span set per zip entry, all
+/// starting at offset 0, so nodes in different parts must never be treated as
+/// nesting. Sorting by `(part, start, -end)` keeps each part's stack walk
+/// independent (the part boundary forces the stack to drain).
+fn derive_tree(idmap: &IdMap) -> Tree<'_> {
+    // Order by part, then opening offset, widest-first on ties, so a containing
+    // element is always visited before the elements it encloses.
+    let mut entries: Vec<(&str, &str, Span)> = idmap
+        .map
+        .iter()
+        .map(|(id, loc)| (id.as_str(), loc.part.as_str(), loc.element))
+        .collect();
+    entries.sort_by(|a, b| {
+        a.1.cmp(b.1)
+            .then_with(|| a.2.start.cmp(&b.2.start))
+            .then_with(|| b.2.end.cmp(&a.2.end))
+    });
+
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut order: Vec<&str> = Vec::with_capacity(entries.len());
+    let mut stack: Vec<(&str, Span)> = Vec::new();
+    let mut cur_part = "";
+    for (id, part, span) in entries {
+        if part != cur_part {
+            stack.clear();
+            cur_part = part;
+        }
+        while let Some((_, top)) = stack.last() {
+            if top.end <= span.start {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        if let Some((parent, _)) = stack.last() {
+            children_of.entry(*parent).or_default().push(id);
+        }
+        order.push(id);
+        stack.push((id, span));
+    }
+
+    Tree { children_of, order }
+}
+
+/// Build the recovery context for an unknown node id by walking the id-map's
+/// byte spans to recover the document tree, then naming a concrete valid
+/// parent and listing its children.
+///
+/// Returns a string like `; valid ids in parent #el_c282a95d: [el_3921cf22,
+/// el_9b010466, ...]`, or `; no valid ids in id-map` when the map is empty.
+/// The leading separator lets callers append it straight onto the base error.
+fn unknown_id_context(idmap: &IdMap) -> String {
+    const MAX_CHILDREN: usize = 16;
+
+    if idmap.map.is_empty() {
+        return "; no valid ids in id-map".to_string();
+    }
+
+    let Tree { children_of, order } = derive_tree(idmap);
+
+    // Prefer a parent that actually has children; fall back to the first node.
+    let parent = order
+        .iter()
+        .copied()
+        .find(|id| children_of.get(id).is_some_and(|c| !c.is_empty()))
+        .unwrap_or(order[0]);
+
+    let siblings: &[&str] = children_of.get(parent).map(|c| c.as_slice()).unwrap_or(&[]);
+    if siblings.is_empty() {
+        // Degenerate tree (e.g. a single root): just list the known ids.
+        let shown: Vec<&str> = order.iter().take(MAX_CHILDREN).copied().collect();
+        let ellipsis = if order.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        return format!("; valid ids: [{}{}]", shown.join(", "), ellipsis);
+    }
+
+    let shown: Vec<&str> = siblings.iter().take(MAX_CHILDREN).copied().collect();
+    let ellipsis = if siblings.len() > shown.len() {
+        ", ..."
+    } else {
+        ""
+    };
+    format!(
+        "; valid ids in parent #{}: [{}{}]",
+        parent,
+        shown.join(", "),
+        ellipsis
+    )
+}
+
+/// Build an `UnknownId` error enriched with nearby valid ids from the id-map.
+fn unknown_id(id: &str, idmap: &IdMap) -> PatchError {
+    PatchError::UnknownId {
+        id: id.to_string(),
+        context: unknown_id_context(idmap),
+    }
+}
+
 /// Extract the `<id>` from a `/structure/<id>...` pointer.
 fn pointer_id(path: &str) -> Option<&str> {
     path.strip_prefix("/structure/")?
@@ -71,8 +186,8 @@ pub struct Patch {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PatchError {
-    #[error("unknown node id `{0}`")]
-    UnknownId(String),
+    #[error("unknown node id `{id}`{context}")]
+    UnknownId { id: String, context: String },
     #[error("guard failed for `{id}`: expected {expected}, found {found}")]
     GuardFailed {
         id: String,
@@ -172,9 +287,7 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
                     | Some(Target::Attr(id, _)) => id,
                     None => return Err(PatchError::BadPath(i, path.clone())),
                 };
-                let loc = idmap
-                    .get(id)
-                    .ok_or_else(|| PatchError::UnknownId(id.to_string()))?;
+                let loc = idmap.get(id).ok_or_else(|| unknown_id(id, idmap))?;
                 if &loc.hash != hash {
                     return Err(PatchError::GuardFailed {
                         id: id.to_string(),
@@ -186,9 +299,7 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
             Op::Replace { path, value } => {
                 match parse_pointer(path).ok_or_else(|| PatchError::BadPath(i, path.clone()))? {
                     Target::Text(id) => {
-                        let loc = idmap
-                            .get(id)
-                            .ok_or_else(|| PatchError::UnknownId(id.to_string()))?;
+                        let loc = idmap.get(id).ok_or_else(|| unknown_id(id, idmap))?;
                         if let Some(runs) = &loc.runs {
                             // Merged paragraph: diff old-vs-new text and rewrite
                             // only the runs that actually changed.
@@ -204,9 +315,7 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
                         }
                     }
                     Target::Attr(id, name) => {
-                        let loc = idmap
-                            .get(id)
-                            .ok_or_else(|| PatchError::UnknownId(id.to_string()))?;
+                        let loc = idmap.get(id).ok_or_else(|| unknown_id(id, idmap))?;
                         let span = loc.attrs.get(name).copied().ok_or_else(|| {
                             PatchError::UnknownAttr {
                                 op: i,
@@ -229,9 +338,7 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
                     Target::Element(id) => id,
                     _ => return Err(PatchError::BadPath(i, path.clone())),
                 };
-                let loc = idmap
-                    .get(id)
-                    .ok_or_else(|| PatchError::UnknownId(id.to_string()))?;
+                let loc = idmap.get(id).ok_or_else(|| unknown_id(id, idmap))?;
                 edits.push(Edit {
                     range: loc.element,
                     bytes: Vec::new(),
@@ -247,9 +354,7 @@ pub fn apply(original: &[u8], idmap: &IdMap, patch: &Patch) -> Result<Vec<u8>, P
                     (None, Some(b)) => (b, false),
                     _ => return Err(PatchError::BadAnchor(i)),
                 };
-                let loc = idmap
-                    .get(anchor)
-                    .ok_or_else(|| PatchError::UnknownId(anchor.to_string()))?;
+                let loc = idmap.get(anchor).ok_or_else(|| unknown_id(anchor, idmap))?;
                 let at = if at_end {
                     loc.element.end
                 } else {

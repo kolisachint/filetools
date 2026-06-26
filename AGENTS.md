@@ -6,7 +6,8 @@
 
 Code:
 
-- `src/lib.rs` — library root: `scan`, `read`, `edit`, `write` public API
+- `src/lib.rs` — library root: `extract`, `scan`, `read`, `grep`, `edit`,
+  `write` public API; autonomous drift recovery on reconstruct
 - `src/bin/filetools.rs` — CLI entry point (clap-based)
 - `src/model.rs` — data model (envelope, id-map, patch types, scan result)
 - `src/idmap.rs` — sidecar id-map: content-addressed byte-span tracking
@@ -28,6 +29,8 @@ Code:
 - `tests/edit_formats.rs` — CSV/HTML edit/write round-trip tests
 - `.github/workflows/` — `ci.yml`, `release.yml`
 - `.agents/commands/` — slash-command definitions (`pr.md`)
+- `docs/` — product overview, install, CLI usage, formats, patch format,
+  drift recovery, grep
 
 ## API Layers
 
@@ -36,31 +39,40 @@ filetools exposes two workflows: a manifest-first path for token-sensitive agent
 ### Manifest-First Workflow (Agent-Optimized)
 
 Use this when the caller needs to select specific blocks before loading content.
+Signatures below match `src/lib.rs`; see `docs/` for prose.
 
 ```rust
 // 1. Get lightweight manifest (no content hydrated)
-pub fn scan(file: &File) -> Result<ScanResult>
+pub fn scan(path: &str, bytes: &[u8]) -> Result<ScanResult>
 
-// 2. Select block IDs from manifest, then hydrate only those
-pub fn read(file: &File, ids: &[String]) -> Result<Vec<Block>>
+// 1b. (optional) Locate blocks by text without hydrating the document.
+//     Each GrepMatch.block_id resolves directly via read/reconstruct.
+pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions)
+    -> Result<Vec<GrepMatch>>
 
-// 3. Apply edits with optional staleness guard
-pub fn edit(doc: &mut DocEnvelope, ops: &[Patch]) -> Result<()>
+// 2. Select block IDs from manifest/grep, then hydrate only those
+//    (empty ids => hydrate everything).
+pub fn read(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>>
 
-// 4. Write back to file
-pub fn write(doc: &DocEnvelope, target: &Path) -> Result<()>
+// 3. Apply a patch and return reconstructed bytes (does not touch disk)
+pub fn edit(envelope: &Envelope, idmap: &IdMap, original: &[u8], patch: &Patch)
+    -> Result<Vec<u8>>
+
+// 4. Same as edit; the public name used to persist a reconstruction
+pub fn write(envelope: &Envelope, idmap: &IdMap, original: &[u8], patch: &Patch)
+    -> Result<Vec<u8>>
 ```
 
-### Full-Content Workflow (Batch)
+`extract(path, bytes) -> ExtractOutput { envelope, idmap }` is the entry that
+produces the `Envelope` + sidecar `IdMap` that `edit`/`write` consume.
 
-Use this when the caller needs the entire document hydrated.
-
-```rust
-// Load everything at once
-pub fn parse(file: &File) -> Result<DocEnvelope>  // alias for read with empty ids
-pub fn edit(doc: &mut DocEnvelope, ops: &[Patch]) -> Result<()>
-pub fn write(doc: &DocEnvelope, target: &Path) -> Result<()>
-```
+**Drift recovery (autonomous).** If `original` no longer matches the hash the
+envelope was extracted from (e.g. openpyxl rewrote the xlsx out-of-band),
+`edit`/`write` do **not** fail. They re-extract the current bytes, re-target
+each op by a parent-anchored *semantic* fingerprint (normalized text, not byte
+hash), and apply atomically against the fresh id-map. Recovery emits a one-line
+note to stderr. If any target is gone or ambiguous after the rewrite, the whole
+patch is refused (nothing is written). See `docs/drift-recovery.md`.
 
 ### Data Structures
 
@@ -112,19 +124,30 @@ Block IDs are structural paths derived from document hierarchy:
 
 Content hash is stored separately as `content_hash` for staleness detection, not as the identity.
 
+> Note: `BlockManifest.content_hash` is a manifest-display field and is not the
+> guard the engine enforces. Concurrency/staleness is enforced two ways: an
+> explicit `test` op (`Op::Test { path, hash }`, validated against the
+> id-map's per-node `hash`), and autonomous parent-anchored drift recovery on
+> reconstruct (semantic fingerprint, see `docs/drift-recovery.md`). The real
+> per-node content hash lives in the sidecar id-map (`NodeLoc.hash`).
+
 ### Patch Operations
 
-Patches reference blocks by ID with optional staleness guard:
+Patches are an RFC-6902-style op list over id-based pointers. The actual wire
+type is `patch::Op` (see `src/patch.rs`):
 
 ```rust
-pub struct Replace {
-    pub id: String,
-    pub expected: Option<String>,  // None = skip staleness check
-    pub replacement: String,
+pub enum Op {
+    Test    { path: String, hash: String },         // optimistic guard
+    Replace { path: String, value: String },        // text or attr value
+    Remove  { path: String },                        // delete element
+    Add     { after: Option<String>, before: Option<String>, value: NewElement },
 }
 ```
 
-The `expected` field, when present, must match the block's `content_hash` or the patch fails. This prevents blind overwrites when the underlying block changed between scan and edit.
+Pointers are `/structure/<id>/text`, `/structure/<id>/attrs/<name>`, or
+`/structure/<id>`. A failed `test` (hash mismatch) or any failed op aborts the
+whole patch atomically; the original is left untouched.
 
 ## Conversational Style
 

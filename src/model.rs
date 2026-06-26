@@ -128,6 +128,10 @@ pub struct GrepMatch {
     pub line: usize,
     /// The matching line, truncated for display.
     pub snippet: String,
+    /// Whether the source format can be edited and reconstructed. `false` flags
+    /// a match in a read-only format (so a caller knows it can locate but not
+    /// patch it). This is a file-level capability hint.
+    pub writable: bool,
 }
 
 /// Options controlling `grep()`.

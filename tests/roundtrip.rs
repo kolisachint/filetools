@@ -244,14 +244,97 @@ fn stale_guard_aborts_atomically() {
 }
 
 #[test]
-fn drift_detected_on_write() {
+fn unknown_id_error_lists_valid_siblings() {
     let bytes = SAMPLE.as_bytes();
     let out = extract("sample.xml", bytes).unwrap();
     let idmap = out.idmap.as_ref().unwrap();
-    // Reconstruct against a *different* original than was extracted.
+
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: "/structure/el_deadbeef/text".to_string(),
+            value: "nope".to_string(),
+        }],
+    };
+    let err = write(&out.envelope, idmap, bytes, &patch)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown node id `el_deadbeef`"), "got: {err}");
+    assert!(err.contains("valid ids"), "got: {err}");
+    // The recovered context must name real ids from the id-map.
+    let some_valid = idmap.map.keys().next().unwrap();
+    assert!(
+        err.contains(some_valid) || idmap.map.keys().any(|k| err.contains(k)),
+        "context should reference a real id-map id; got: {err}"
+    );
+}
+
+// Preset B: drift no longer hard-fails. An out-of-band rewrite of the original
+// triggers autonomous recovery — re-extract + fingerprint re-target — so a
+// patch that can still be located is applied against the rewritten bytes.
+
+#[test]
+fn drift_empty_patch_is_noop_on_rewritten_original() {
+    let bytes = SAMPLE.as_bytes();
+    let out = extract("sample.xml", bytes).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    // A *different* (rewritten) original; an empty patch must recover to a no-op.
     let other = b"<doc/>";
-    let err = write(&out.envelope, idmap, other, &Patch { patch: vec![] }).unwrap_err();
-    assert!(err.to_string().contains("drifted"), "got: {err}");
+    let result = write(&out.envelope, idmap, other, &Patch { patch: vec![] }).unwrap();
+    assert_eq!(
+        result, other,
+        "empty patch on drifted file should be a no-op"
+    );
+}
+
+#[test]
+fn drift_recovers_and_applies_when_content_survives() {
+    let bytes = SAMPLE.as_bytes();
+    let out = extract("sample.xml", bytes).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_text(&out.envelope, "First paragraph.");
+
+    // Simulate an out-of-band rewrite: same content, reformatted whitespace so
+    // byte offsets (and thus the recorded id-map) no longer match.
+    let rewritten = SAMPLE.replace("\n  ", "\n    ");
+    assert_ne!(rewritten.as_bytes(), bytes, "rewrite must change the bytes");
+
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "First paragraph, recovered.".to_string(),
+        }],
+    };
+    let s = String::from_utf8(write(&out.envelope, idmap, rewritten.as_bytes(), &patch).unwrap())
+        .unwrap();
+    assert!(s.contains("First paragraph, recovered."), "got: {s}");
+    assert!(
+        s.contains("Second paragraph."),
+        "other content preserved; got: {s}"
+    );
+}
+
+#[test]
+fn drift_aborts_when_target_content_gone() {
+    let bytes = SAMPLE.as_bytes();
+    let out = extract("sample.xml", bytes).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_text(&out.envelope, "First paragraph.");
+
+    // Rewrite that deletes the target paragraph entirely.
+    let rewritten = SAMPLE.replace("    <p>First paragraph.</p>\n", "");
+    assert!(!rewritten.contains("First paragraph."));
+
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "should not land".to_string(),
+        }],
+    };
+    let err = write(&out.envelope, idmap, rewritten.as_bytes(), &patch).unwrap_err();
+    assert!(
+        err.to_string().contains("no longer exists"),
+        "expected fail-loud on vanished target; got: {err}"
+    );
 }
 
 #[test]
@@ -426,6 +509,53 @@ fn xlsx_edits_shared_strings() {
     assert!(s.contains("<t>APAC</t>"));
     // Untouched part preserved.
     assert_eq!(read_docx_part(&new, "xl/workbook.xml"), workbook);
+}
+
+// Simulates the motivating openpyxl scenario: an external tool rewrites the
+// whole workbook, re-emitting parts with different bytes (added attributes,
+// reflowed markup) while preserving every cell value. Byte hashes all change;
+// semantic recovery re-targets the patch by text signature and applies it.
+#[test]
+fn xlsx_drift_recovers_after_external_rewrite() {
+    let shared = r#"<?xml version="1.0"?><sst xmlns="x" count="2"><si><t>Region</t></si><si><t>APAC</t></si></sst>"#;
+    let workbook = r#"<?xml version="1.0"?><workbook/>"#;
+    let xlsx = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("xl/workbook.xml", workbook),
+        ("xl/sharedStrings.xml", shared),
+    ]);
+
+    let out = extract("book.xlsx", &xlsx).unwrap();
+    let idmap = out.idmap.as_ref().unwrap();
+    let id = id_with_text(&out.envelope, "Region");
+
+    // External rewrite: same values, re-emitted bytes (attrs + whitespace).
+    let rewritten_shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="x" count="2" uniqueCount="2">
+  <si><t xml:space="preserve">Region</t></si>
+  <si><t xml:space="preserve">APAC</t></si>
+</sst>"#;
+    let rewritten = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("xl/workbook.xml", workbook),
+        ("xl/sharedStrings.xml", rewritten_shared),
+    ]);
+    assert_ne!(rewritten, xlsx, "external rewrite must change the bytes");
+
+    let patch = Patch {
+        patch: vec![Op::Replace {
+            path: format!("/structure/{id}/text"),
+            value: "Area".to_string(),
+        }],
+    };
+    // Patch authored against the original id-map, applied to drifted bytes.
+    let new = write(&out.envelope, idmap, &rewritten, &patch).unwrap();
+    let s = read_docx_part(&new, "xl/sharedStrings.xml");
+    assert!(
+        s.contains("Area"),
+        "edit landed on recovered node; got: {s}"
+    );
+    assert!(s.contains("APAC"), "sibling value preserved; got: {s}");
 }
 
 #[test]
@@ -808,4 +938,64 @@ fn pdf_rejects_structural_ops() {
         }],
     };
     assert!(write(&out.envelope, out.idmap.as_ref().unwrap(), &pdf, &patch).is_err());
+}
+
+// --- grep (discovery) -------------------------------------------------------
+
+#[test]
+fn grep_finds_block_ids_for_matching_text() {
+    use filetools_rs::grep;
+    use filetools_rs::model::GrepOptions;
+
+    let bytes = SAMPLE.as_bytes();
+    let matches = grep("sample.xml", bytes, "paragraph", &GrepOptions::default()).unwrap();
+    // "First paragraph." and "Second paragraph." both match.
+    assert_eq!(matches.len(), 2, "got: {matches:?}");
+    assert!(matches.iter().all(|m| m.writable), "xml is writable");
+
+    // Returned ids resolve via read() back to the matching nodes.
+    let out = filetools_rs::extract("sample.xml", bytes).unwrap();
+    let first = id_with_text(&out.envelope, "First paragraph.");
+    let second = id_with_text(&out.envelope, "Second paragraph.");
+    let ids: Vec<&str> = matches.iter().map(|m| m.block_id.as_str()).collect();
+    assert!(ids.contains(&first.as_str()));
+    assert!(ids.contains(&second.as_str()));
+}
+
+#[test]
+fn grep_ignore_case_and_limit() {
+    use filetools_rs::grep;
+    use filetools_rs::model::GrepOptions;
+
+    let bytes = SAMPLE.as_bytes();
+
+    // Case-sensitive: "QUARTERLY" matches nothing.
+    let none = grep("s.xml", bytes, "QUARTERLY", &GrepOptions::default()).unwrap();
+    assert!(none.is_empty());
+
+    // Case-insensitive: matches the title.
+    let ci = grep(
+        "s.xml",
+        bytes,
+        "QUARTERLY",
+        &GrepOptions {
+            ignore_case: true,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(ci.len(), 1);
+
+    // Limit caps the result count.
+    let capped = grep(
+        "s.xml",
+        bytes,
+        "paragraph",
+        &GrepOptions {
+            ignore_case: false,
+            limit: Some(1),
+        },
+    )
+    .unwrap();
+    assert_eq!(capped.len(), 1);
 }
