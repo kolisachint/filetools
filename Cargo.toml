@@ -2,6 +2,11 @@
 name = "filetools"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/kolisachint/filetools"
+readme = "README.md"
+keywords = ["llm", "file-serialization", "lossless", "patch", "xml"]
+categories = ["command-line-utilities", "parser-implementations"]
 description = "Reversible, token-efficient file serialization for LLMs: extract to semantic JSON, patch, reconstruct losslessly."
 
 [[bin]]
