@@ -46,6 +46,22 @@ pub fn scan_pptx(bytes: &[u8]) -> Result<OptimizedScanResult> {
             format!("Slide {}: {}", idx + 1, preview_text(&preview))
         };
 
+        // The slide block keeps a truncated preview as its own text (so the
+        // scan manifest stays lightweight), while its full paragraph text is
+        // carried as children so `read`/`grep` can reach every run, not just
+        // the preview.
+        let children = slide_paragraphs(&content)
+            .into_iter()
+            .enumerate()
+            .map(|(p, para)| DocNode {
+                id: format!("slide[{idx}].p[{p}]"),
+                tag: "_slide_text".to_string(),
+                attrs: Vec::new(),
+                text: Some(para),
+                children: Vec::new(),
+            })
+            .collect();
+
         structure.push(DocNode {
             id: format!("slide[{idx}]"),
             tag: "_slide".to_string(),
@@ -60,7 +76,7 @@ pub fn scan_pptx(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 },
             ],
             text: Some(text),
-            children: Vec::new(), // Content loaded on demand
+            children,
         });
         total_tokens += estimate_node_tokens(structure.last().unwrap());
     }
@@ -209,7 +225,9 @@ pub fn scan_drawio(bytes: &[u8]) -> Result<OptimizedScanResult> {
             let mut cell_count = 0;
             count_nodes(&node.children, &mut cell_count, &mut total_tokens);
 
-            // Create diagram-level block
+            // Create diagram-level block, keeping the cells as children so
+            // grep/read reach cell labels (drawio stores labels in the `value`
+            // attribute, not element text).
             structure.push(DocNode {
                 id: format!("diagram:{}", diagram_name),
                 tag: "_diagram_block".to_string(),
@@ -224,7 +242,7 @@ pub fn scan_drawio(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     },
                 ],
                 text: Some(format!("Diagram ({} cells)", cell_count)),
-                children: Vec::new(), // Content loaded on demand
+                children: node.children.clone(),
             });
 
             block_count += 1;
@@ -286,7 +304,11 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
                         value: current_section.clone(),
                     }],
                     text: Some(section_preview),
-                    children: Vec::new(), // Content loaded on demand
+                    children: markdown_section_children(
+                        section_num,
+                        &current_section,
+                        &current_content,
+                    ),
                 });
 
                 block_count += 1;
@@ -307,6 +329,7 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
     if !current_section.is_empty() || !current_content.is_empty() {
         let preview = preview_text(&current_content.join(" "));
 
+        let children = markdown_section_children(section_num, &current_section, &current_content);
         structure.push(DocNode {
             id: format!("section[{}]", section_num),
             tag: "_section".to_string(),
@@ -315,7 +338,7 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 value: current_section,
             }],
             text: Some(preview),
-            children: Vec::new(),
+            children,
         });
 
         block_count += 1;
@@ -343,6 +366,32 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
         block_count,
         total_tokens,
     })
+}
+
+/// Build the hydrated children of a markdown section: the heading (if any) plus
+/// every body line, each as its own text node, so grep/read reach the whole
+/// section rather than only its truncated preview.
+fn markdown_section_children(section_num: usize, heading: &str, body: &[String]) -> Vec<DocNode> {
+    let mut children = Vec::new();
+    if !heading.is_empty() {
+        children.push(DocNode {
+            id: format!("section[{section_num}].heading"),
+            tag: "_md_heading".to_string(),
+            attrs: Vec::new(),
+            text: Some(heading.to_string()),
+            children: Vec::new(),
+        });
+    }
+    for (i, line) in body.iter().enumerate() {
+        children.push(DocNode {
+            id: format!("section[{section_num}].line[{i}]"),
+            tag: "_md_line".to_string(),
+            attrs: Vec::new(),
+            text: Some(line.clone()),
+            children: Vec::new(),
+        });
+    }
+    children
 }
 
 /// Scan binary format (JPG, PNG) with metadata blocks.
@@ -474,6 +523,19 @@ pub fn scan_mermaid(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 Some(n) => format!("subgraph:{n}"),
                 None => format!("body[{idx}]"),
             };
+            // Carry every statement as a child so grep/read reach statements
+            // past the preview cutoff.
+            let children = lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| DocNode {
+                    id: format!("{id}.stmt[{i}]"),
+                    tag: "_mermaid_stmt".to_string(),
+                    attrs: Vec::new(),
+                    text: Some(line.clone()),
+                    children: Vec::new(),
+                })
+                .collect();
             structure.push(DocNode {
                 id,
                 tag: "_mermaid_group".to_string(),
@@ -482,7 +544,7 @@ pub fn scan_mermaid(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     value: lines.len().to_string(),
                 }],
                 text: Some(preview),
-                children: Vec::new(),
+                children,
             });
             *idx += 1;
         };
@@ -563,6 +625,19 @@ pub fn scan_csv(bytes: &[u8]) -> Result<OptimizedScanResult> {
             .get(start)
             .map(|r| preview_text(r))
             .unwrap_or_default();
+        // Carry every row in the range as a child so grep/read reach the whole
+        // chunk, not just its first row.
+        let children = data_rows[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| DocNode {
+                id: format!("rows[{}-{}].r[{}]", start, end - 1, start + i),
+                tag: "_csv_row".to_string(),
+                attrs: Vec::new(),
+                text: Some(line.to_string()),
+                children: Vec::new(),
+            })
+            .collect();
         structure.push(DocNode {
             id: format!("rows[{}-{}]", start, end - 1),
             tag: "_csv_rows".to_string(),
@@ -571,7 +646,7 @@ pub fn scan_csv(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 value: (end - start).to_string(),
             }],
             text: Some(format!("Rows {}-{}: {}", start, end - 1, preview)),
-            children: Vec::new(),
+            children,
         });
         start = end;
     }
@@ -644,6 +719,20 @@ pub fn scan_html(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 id if id.starts_with("section") => "_html_section",
                 _ => "_html_paragraph",
             };
+            let full = strip_html(&el.text);
+            // Keep the truncated preview as the block's own text, but carry the
+            // full text as a child so grep/read reach content past the preview.
+            let children = if full.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![DocNode {
+                    id: format!("{}.text", el.id),
+                    tag: "_html_text".to_string(),
+                    attrs: Vec::new(),
+                    text: Some(full.clone()),
+                    children: Vec::new(),
+                }]
+            };
             DocNode {
                 id: el.id,
                 tag: tag.to_string(),
@@ -651,8 +740,8 @@ pub fn scan_html(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     name: "level".to_string(),
                     value: el.tag,
                 }],
-                text: Some(preview_text(&strip_html(&el.text))),
-                children: Vec::new(),
+                text: Some(preview_text(&full)),
+                children,
             }
         })
         .collect();
@@ -783,24 +872,78 @@ fn slide_number(part: &str) -> usize {
 }
 
 /// Count `<a:t>` text runs and collect the first runs' text for a preview,
-/// without a full XML parse.
+/// without a full XML parse. Handles runs carrying attributes
+/// (`<a:t xml:space="preserve">`) and unescapes XML entities.
 fn scan_drawingml_text(content: &str) -> (usize, String) {
     let mut count = 0usize;
     let mut preview = String::new();
-    let mut rest = content;
-    while let Some(open) = rest.find("<a:t>") {
-        let after = &rest[open + 5..];
-        let Some(close) = after.find("</a:t>") else {
-            break;
-        };
+    for_each_drawingml_run(content, |text| {
         count += 1;
-        if preview.len() < 100 {
+        if preview.chars().count() < 100 {
             if !preview.is_empty() {
                 preview.push(' ');
             }
-            preview.push_str(&after[..close]);
+            preview.push_str(text);
         }
-        rest = &after[close + 6..];
-    }
+    });
     (count, preview)
+}
+
+/// Split a slide's DrawingML into paragraph text, one `String` per `<a:p>`,
+/// with each paragraph's `<a:t>` runs concatenated and entity-unescaped. Empty
+/// paragraphs are dropped. Slides with no `<a:p>` fall back to a single
+/// whole-part paragraph so stray runs are still surfaced.
+fn slide_paragraphs(content: &str) -> Vec<String> {
+    let mut paras = Vec::new();
+    for chunk in content.split("<a:p>").skip(1) {
+        let body = chunk.split("</a:p>").next().unwrap_or(chunk);
+        let text = drawingml_runs_text(body);
+        if !text.trim().is_empty() {
+            paras.push(text);
+        }
+    }
+    if paras.is_empty() {
+        let text = drawingml_runs_text(content);
+        if !text.trim().is_empty() {
+            paras.push(text);
+        }
+    }
+    paras
+}
+
+/// Concatenate the text of every `<a:t>` run in `fragment` (space-separated),
+/// unescaping XML entities.
+fn drawingml_runs_text(fragment: &str) -> String {
+    let mut out = String::new();
+    for_each_drawingml_run(fragment, |text| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(text);
+    });
+    out
+}
+
+/// Invoke `f` with the unescaped text of each `<a:t …>…</a:t>` run in `content`,
+/// in document order. Tolerates run attributes and self-closing `<a:t/>`.
+fn for_each_drawingml_run(content: &str, mut f: impl FnMut(&str)) {
+    let mut rest = content;
+    while let Some(open) = rest.find("<a:t") {
+        let after = &rest[open + 4..];
+        // A run element opens with `>`, a space (attrs), or `/` (self-close);
+        // anything else (e.g. a hypothetical `<a:table`) is a false positive.
+        if !(after.starts_with('>') || after.starts_with(' ') || after.starts_with('/')) {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        if after[..gt].ends_with('/') {
+            rest = &after[gt + 1..]; // self-closing run, no text
+            continue;
+        }
+        let body = &after[gt + 1..];
+        let Some(close) = body.find("</a:t>") else { break };
+        f(&super::xml_unescape(&body[..close]));
+        rest = &body[close + "</a:t>".len()..];
+    }
 }

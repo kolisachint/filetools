@@ -777,7 +777,7 @@ pub fn clear_scan_cache() {
 pub fn read(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
     // For XLSX, use optimized path that avoids full cell parsing
     if path.ends_with(".xlsx") {
-        return read_xlsx(path, bytes, ids);
+        return read_xlsx(bytes, ids);
     }
 
     // Formats with an optimized scan return their block tree directly so that
@@ -837,7 +837,6 @@ pub fn read(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
 ///
 /// `needle` is matched as a literal substring (per line of a block's text).
 pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions) -> Result<Vec<GrepMatch>> {
-    let nodes = read(path, bytes, &[])?;
     let writable = is_writable_format(path, bytes);
 
     let hay_needle = if opts.ignore_case {
@@ -846,9 +845,190 @@ pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions) -> Resul
         needle.to_string()
     };
 
+    // XLSX cells aren't surfaced by the lightweight scan structure, so grep
+    // hydrates each row range on demand and reports the range id that `read`
+    // accepts — mirroring the CSV handler's `rows[a-b]` block addressing.
+    if path.ends_with(".xlsx") {
+        return grep_xlsx(bytes, &hay_needle, opts, writable);
+    }
+
+    // Formats with a dedicated optimized scan hydrate their full content as
+    // children of each top-level block (the block's own text is only a
+    // truncated preview). Search the hydrated content and attribute every hit to
+    // the block's scan-emitted id, the id `read` accepts. This reaches content
+    // past the preview — slide paragraphs, every CSV/section row, deep diagram
+    // statements — that a preview-only walk would miss.
+    if let Some(structure) = optimized_structure(path, bytes)? {
+        return Ok(grep_blocks(&structure, &hay_needle, opts, writable));
+    }
+
+    let nodes = read(path, bytes, &[])?;
     let mut matches = Vec::new();
     grep_walk(&nodes, &hay_needle, opts, writable, &mut matches);
     Ok(matches)
+}
+
+/// Grep a list of top-level optimized blocks. For each block, search its
+/// hydrated descendant text (plus drawio `value` labels) and attribute every hit
+/// to the block's own id. A block with no children is searched on its own text
+/// instead, so metadata-only blocks (zip entries, image headers) stay greppable;
+/// a block *with* children skips its own text because that is a synthetic
+/// preview whose full content already lives in the children.
+fn grep_blocks(
+    structure: &[DocNode],
+    needle: &str,
+    opts: &GrepOptions,
+    writable: bool,
+) -> Vec<GrepMatch> {
+    let mut matches = Vec::new();
+    for block in structure {
+        if opts.limit.is_some_and(|l| matches.len() >= l) {
+            break;
+        }
+
+        let mut hay = String::new();
+        if block.children.is_empty() {
+            if let Some(t) = &block.text {
+                push_line(&mut hay, t);
+            }
+            if let Some(v) = block.attrs.iter().find(|a| a.name == "value") {
+                push_line(&mut hay, &v.value);
+            }
+        } else {
+            collect_block_text(block, &mut hay);
+        }
+
+        for (i, line) in hay.lines().enumerate() {
+            let probe = if opts.ignore_case {
+                line.to_lowercase()
+            } else {
+                line.to_string()
+            };
+            if probe.contains(needle) {
+                matches.push(GrepMatch {
+                    block_id: block.id.clone(),
+                    line: i + 1,
+                    snippet: truncate_ellipsis(line.trim(), 120),
+                    writable,
+                });
+                if opts.limit.is_some_and(|l| matches.len() >= l) {
+                    break;
+                }
+            }
+        }
+    }
+    matches
+}
+
+/// Append every descendant node's text (and drawio `value` label) to `out`, one
+/// per line, in document order.
+fn collect_block_text(node: &DocNode, out: &mut String) {
+    for c in &node.children {
+        if let Some(t) = &c.text {
+            push_line(out, t);
+        }
+        if let Some(v) = c.attrs.iter().find(|a| a.name == "value") {
+            push_line(out, &v.value);
+        }
+        collect_block_text(c, out);
+    }
+}
+
+/// Append `s` as a new line to `out`, skipping empties.
+fn push_line(out: &mut String, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(s);
+}
+
+/// Grep an xlsx workbook: match sheet-name blocks directly, then hydrate each
+/// row range and match its resolved cell values, attributing every cell hit to
+/// the range's block id so the caller can hydrate it via `read`.
+fn grep_xlsx(
+    bytes: &[u8],
+    needle: &str,
+    opts: &GrepOptions,
+    writable: bool,
+) -> Result<Vec<GrepMatch>> {
+    let result = handlers::xlsx::scan_xlsx(bytes)?;
+    let mut matches = Vec::new();
+
+    let hit = |hay: &str| -> bool {
+        if opts.ignore_case {
+            hay.to_lowercase().contains(needle)
+        } else {
+            hay.contains(needle)
+        }
+    };
+
+    for node in &result.structure {
+        if let Some(limit) = opts.limit {
+            if matches.len() >= limit {
+                return Ok(matches);
+            }
+        }
+
+        match node.tag.as_str() {
+            "_sheet" => {
+                if let Some(text) = &node.text {
+                    if hit(text) {
+                        matches.push(GrepMatch {
+                            block_id: node.id.clone(),
+                            line: 1,
+                            snippet: truncate_ellipsis(text.trim(), 120),
+                            writable,
+                        });
+                    }
+                }
+            }
+            "_row_range" => {
+                let sheet_idx: usize = attr(node, "sheet_idx").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let sheet_part = match attr(node, "sheet") {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let start: usize = attr(node, "start").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let end: usize = attr(node, "end").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let rows =
+                    handlers::xlsx::load_row_range(bytes, sheet_part, sheet_idx, start, end)?;
+                for row in &rows {
+                    for cell in &row.children {
+                        let Some(text) = &cell.text else { continue };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if hit(text) {
+                            matches.push(GrepMatch {
+                                block_id: node.id.clone(),
+                                line: 1,
+                                snippet: truncate_ellipsis(text.trim(), 120),
+                                writable,
+                            });
+                            if opts.limit.is_some_and(|l| matches.len() >= l) {
+                                return Ok(matches);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(matches)
+}
+
+/// First value of attribute `name` on a node.
+fn attr<'a>(node: &'a DocNode, name: &str) -> Option<&'a str> {
+    node.attrs
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| a.value.as_str())
 }
 
 /// Recursively scan `nodes`, pushing a `GrepMatch` per matching line of each
@@ -930,7 +1110,7 @@ fn optimized_structure(path: &str, bytes: &[u8]) -> Result<Option<Vec<DocNode>>>
 
 /// Read XLSX blocks using optimized path.
 /// For row ranges, loads only the requested cells.
-fn read_xlsx(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
+fn read_xlsx(bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
     if ids.is_empty() {
         // Return sheet-level blocks
         let xlsx_result = handlers::xlsx::scan_xlsx(bytes)?;
@@ -944,7 +1124,7 @@ fn read_xlsx(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
     for id in ids {
         // Check if this is a row range request
         if id.contains(".rows[") {
-            if let Some(nodes) = load_row_range_nodes(path, bytes, id)? {
+            if let Some(nodes) = load_row_range_nodes(bytes, id)? {
                 result.extend(nodes);
             }
         } else {
@@ -964,7 +1144,7 @@ fn read_xlsx(path: &str, bytes: &[u8], ids: &[String]) -> Result<Vec<DocNode>> {
 
 /// Load cells for a row range request.
 /// Parses the ID format "sheet[0].rows[0-99]" and loads the corresponding cells.
-fn load_row_range_nodes(path: &str, bytes: &[u8], id: &str) -> Result<Option<Vec<DocNode>>> {
+fn load_row_range_nodes(bytes: &[u8], id: &str) -> Result<Option<Vec<DocNode>>> {
     // Parse the ID: "sheet[0].rows[0-99]"
     let parts: Vec<&str> = id.split(".rows[").collect();
     if parts.len() != 2 {
@@ -980,6 +1160,7 @@ fn load_row_range_nodes(path: &str, bytes: &[u8], id: &str) -> Result<Option<Vec
         return Ok(None);
     }
 
+    // Range ids are inclusive on both ends ("0-99" → rows 0..=99).
     let start_row: usize = range_parts[0].parse().unwrap_or(0);
     let end_row: usize = range_parts[1].parse().unwrap_or(0);
 
@@ -987,20 +1168,19 @@ fn load_row_range_nodes(path: &str, bytes: &[u8], id: &str) -> Result<Option<Vec
     let sheet_idx_str = sheet_id.trim_start_matches("sheet[").trim_end_matches(']');
     let sheet_idx: usize = sheet_idx_str.parse().unwrap_or(0);
 
-    // Find the worksheet part
-    let extract_out = extract(path, bytes)?;
+    // Resolve the worksheet part the same way `scan_xlsx` orders them, so a
+    // range id minted by scan addresses the same sheet here.
+    let sheet_part = match handlers::xlsx::scan_xlsx(bytes)?
+        .sheets
+        .get(sheet_idx)
+        .map(|s| s.part_name.clone())
+    {
+        Some(part) => part,
+        None => return Ok(None),
+    };
 
-    // Get the worksheet part name
-    let sheet_part = format!("xl/worksheets/sheet{}.xml", sheet_idx + 1);
-
-    // Load the row range using the xlsx handler
-    let (nodes, _idmap) = handlers::xlsx::load_row_range(
-        bytes,
-        &sheet_part,
-        start_row,
-        end_row,
-        &extract_out.envelope.source.hash,
-    )?;
+    let nodes =
+        handlers::xlsx::load_row_range(bytes, &sheet_part, sheet_idx, start_row, end_row)?;
 
     Ok(Some(nodes))
 }
