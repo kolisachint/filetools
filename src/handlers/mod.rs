@@ -82,6 +82,20 @@ pub fn for_type(type_name: &str) -> Option<Box<dyn Handler>> {
     }
 }
 
+/// Unescape the five predefined XML entities. `&amp;` is resolved last so a
+/// literal like `&amp;lt;` round-trips to `&lt;` rather than `<`.
+pub(crate) fn xml_unescape(s: &str) -> String {
+    // Fast path: nothing to do for the overwhelmingly common entity-free text.
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn looks_like_xml(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(256)];
     let mut i = 0;

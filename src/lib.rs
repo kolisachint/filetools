@@ -852,6 +852,12 @@ pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions) -> Resul
         return grep_xlsx(bytes, &hay_needle, opts, writable);
     }
 
+    // PPTX slide text is hydrated as paragraph children of each slide block;
+    // attribute every paragraph hit to the slide id `read` accepts.
+    if path.ends_with(".pptx") {
+        return grep_pptx(bytes, &hay_needle, opts, writable);
+    }
+
     let nodes = read(path, bytes, &[])?;
     let mut matches = Vec::new();
     grep_walk(&nodes, &hay_needle, opts, writable, &mut matches);
@@ -930,6 +936,53 @@ fn grep_xlsx(
                 }
             }
             _ => {}
+        }
+    }
+
+    Ok(matches)
+}
+
+/// Grep a pptx deck: search each slide's full paragraph text (carried as the
+/// slide block's children) and attribute every hit to the slide's block id, the
+/// id `read` accepts. The synthetic "Slide N:" preview is not searched so the
+/// literal word "slide" doesn't spuriously match every slide.
+fn grep_pptx(
+    bytes: &[u8],
+    needle: &str,
+    opts: &GrepOptions,
+    writable: bool,
+) -> Result<Vec<GrepMatch>> {
+    let result = handlers::optimized::scan_pptx(bytes)?;
+    let mut matches = Vec::new();
+
+    for slide in &result.structure {
+        if opts.limit.is_some_and(|l| matches.len() >= l) {
+            return Ok(matches);
+        }
+        // Join the slide's paragraphs so line numbers track paragraph order.
+        let full = slide
+            .children
+            .iter()
+            .filter_map(|c| c.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (i, line) in full.lines().enumerate() {
+            let hay = if opts.ignore_case {
+                line.to_lowercase()
+            } else {
+                line.to_string()
+            };
+            if hay.contains(needle) {
+                matches.push(GrepMatch {
+                    block_id: slide.id.clone(),
+                    line: i + 1,
+                    snippet: truncate_ellipsis(line.trim(), 120),
+                    writable,
+                });
+                if opts.limit.is_some_and(|l| matches.len() >= l) {
+                    return Ok(matches);
+                }
+            }
         }
     }
 

@@ -23,6 +23,7 @@ use std::io::{Cursor, Read};
 use anyhow::{Context, Result};
 use zip::ZipArchive;
 
+use super::xml_unescape;
 use crate::model::{Attr, DocNode};
 
 /// XLSX worksheet metadata.
@@ -422,16 +423,6 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let after = &tag[pos + pat.len()..];
     let end = after.find('"')?;
     Some(&after[..end])
-}
-
-/// Unescape the five predefined XML entities. `&amp;` is resolved last so a
-/// literal like `&amp;lt;` round-trips to `&lt;` rather than `<`.
-fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 /// List entry names in the container.

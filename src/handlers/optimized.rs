@@ -46,6 +46,22 @@ pub fn scan_pptx(bytes: &[u8]) -> Result<OptimizedScanResult> {
             format!("Slide {}: {}", idx + 1, preview_text(&preview))
         };
 
+        // The slide block keeps a truncated preview as its own text (so the
+        // scan manifest stays lightweight), while its full paragraph text is
+        // carried as children so `read`/`grep` can reach every run, not just
+        // the preview.
+        let children = slide_paragraphs(&content)
+            .into_iter()
+            .enumerate()
+            .map(|(p, para)| DocNode {
+                id: format!("slide[{idx}].p[{p}]"),
+                tag: "_slide_text".to_string(),
+                attrs: Vec::new(),
+                text: Some(para),
+                children: Vec::new(),
+            })
+            .collect();
+
         structure.push(DocNode {
             id: format!("slide[{idx}]"),
             tag: "_slide".to_string(),
@@ -60,7 +76,7 @@ pub fn scan_pptx(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 },
             ],
             text: Some(text),
-            children: Vec::new(), // Content loaded on demand
+            children,
         });
         total_tokens += estimate_node_tokens(structure.last().unwrap());
     }
@@ -783,24 +799,78 @@ fn slide_number(part: &str) -> usize {
 }
 
 /// Count `<a:t>` text runs and collect the first runs' text for a preview,
-/// without a full XML parse.
+/// without a full XML parse. Handles runs carrying attributes
+/// (`<a:t xml:space="preserve">`) and unescapes XML entities.
 fn scan_drawingml_text(content: &str) -> (usize, String) {
     let mut count = 0usize;
     let mut preview = String::new();
-    let mut rest = content;
-    while let Some(open) = rest.find("<a:t>") {
-        let after = &rest[open + 5..];
-        let Some(close) = after.find("</a:t>") else {
-            break;
-        };
+    for_each_drawingml_run(content, |text| {
         count += 1;
-        if preview.len() < 100 {
+        if preview.chars().count() < 100 {
             if !preview.is_empty() {
                 preview.push(' ');
             }
-            preview.push_str(&after[..close]);
+            preview.push_str(text);
         }
-        rest = &after[close + 6..];
-    }
+    });
     (count, preview)
+}
+
+/// Split a slide's DrawingML into paragraph text, one `String` per `<a:p>`,
+/// with each paragraph's `<a:t>` runs concatenated and entity-unescaped. Empty
+/// paragraphs are dropped. Slides with no `<a:p>` fall back to a single
+/// whole-part paragraph so stray runs are still surfaced.
+fn slide_paragraphs(content: &str) -> Vec<String> {
+    let mut paras = Vec::new();
+    for chunk in content.split("<a:p>").skip(1) {
+        let body = chunk.split("</a:p>").next().unwrap_or(chunk);
+        let text = drawingml_runs_text(body);
+        if !text.trim().is_empty() {
+            paras.push(text);
+        }
+    }
+    if paras.is_empty() {
+        let text = drawingml_runs_text(content);
+        if !text.trim().is_empty() {
+            paras.push(text);
+        }
+    }
+    paras
+}
+
+/// Concatenate the text of every `<a:t>` run in `fragment` (space-separated),
+/// unescaping XML entities.
+fn drawingml_runs_text(fragment: &str) -> String {
+    let mut out = String::new();
+    for_each_drawingml_run(fragment, |text| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(text);
+    });
+    out
+}
+
+/// Invoke `f` with the unescaped text of each `<a:t …>…</a:t>` run in `content`,
+/// in document order. Tolerates run attributes and self-closing `<a:t/>`.
+fn for_each_drawingml_run(content: &str, mut f: impl FnMut(&str)) {
+    let mut rest = content;
+    while let Some(open) = rest.find("<a:t") {
+        let after = &rest[open + 4..];
+        // A run element opens with `>`, a space (attrs), or `/` (self-close);
+        // anything else (e.g. a hypothetical `<a:table`) is a false positive.
+        if !(after.starts_with('>') || after.starts_with(' ') || after.starts_with('/')) {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        if after[..gt].ends_with('/') {
+            rest = &after[gt + 1..]; // self-closing run, no text
+            continue;
+        }
+        let body = &after[gt + 1..];
+        let Some(close) = body.find("</a:t>") else { break };
+        f(&super::xml_unescape(&body[..close]));
+        rest = &body[close + "</a:t>".len()..];
+    }
 }

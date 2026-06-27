@@ -71,6 +71,10 @@ for m in &matches {
   attributed to its row-range block (`sheet[n].rows[a-b]`), the id `read`
   accepts, so the loop funnels straight into hydration and edit. Sheet-name
   blocks (`sheet[n]`) also match.
+- **Slides (pptx):** a slide's full paragraph text is searched, not just the
+  truncated scan preview — including runs that carry attributes
+  (`<a:t xml:space="preserve">`) and entity-encoded text. Hits are attributed to
+  the slide block (`slide[n]`), which `read` hydrates to the slide's paragraphs.
 
 ## Typical loop
 
