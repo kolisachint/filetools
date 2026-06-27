@@ -65,6 +65,12 @@ for m in &matches {
   several lines yields several matches.
 - `grep` walks the same block tree `read` produces, so ids line up exactly with
   what `read`/`reconstruct` expect.
+- **Spreadsheets (xlsx):** cell text is resolved before matching — shared
+  strings (`t="s"`), inline strings (`t="inlineStr"`), formula string results
+  (`t="str"`), booleans, and numeric/date values all participate. A cell hit is
+  attributed to its row-range block (`sheet[n].rows[a-b]`), the id `read`
+  accepts, so the loop funnels straight into hydration and edit. Sheet-name
+  blocks (`sheet[n]`) also match.
 
 ## Typical loop
 
