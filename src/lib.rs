@@ -852,16 +852,97 @@ pub fn grep(path: &str, bytes: &[u8], needle: &str, opts: &GrepOptions) -> Resul
         return grep_xlsx(bytes, &hay_needle, opts, writable);
     }
 
-    // PPTX slide text is hydrated as paragraph children of each slide block;
-    // attribute every paragraph hit to the slide id `read` accepts.
-    if path.ends_with(".pptx") {
-        return grep_pptx(bytes, &hay_needle, opts, writable);
+    // Formats with a dedicated optimized scan hydrate their full content as
+    // children of each top-level block (the block's own text is only a
+    // truncated preview). Search the hydrated content and attribute every hit to
+    // the block's scan-emitted id, the id `read` accepts. This reaches content
+    // past the preview — slide paragraphs, every CSV/section row, deep diagram
+    // statements — that a preview-only walk would miss.
+    if let Some(structure) = optimized_structure(path, bytes)? {
+        return Ok(grep_blocks(&structure, &hay_needle, opts, writable));
     }
 
     let nodes = read(path, bytes, &[])?;
     let mut matches = Vec::new();
     grep_walk(&nodes, &hay_needle, opts, writable, &mut matches);
     Ok(matches)
+}
+
+/// Grep a list of top-level optimized blocks. For each block, search its
+/// hydrated descendant text (plus drawio `value` labels) and attribute every hit
+/// to the block's own id. A block with no children is searched on its own text
+/// instead, so metadata-only blocks (zip entries, image headers) stay greppable;
+/// a block *with* children skips its own text because that is a synthetic
+/// preview whose full content already lives in the children.
+fn grep_blocks(
+    structure: &[DocNode],
+    needle: &str,
+    opts: &GrepOptions,
+    writable: bool,
+) -> Vec<GrepMatch> {
+    let mut matches = Vec::new();
+    for block in structure {
+        if opts.limit.is_some_and(|l| matches.len() >= l) {
+            break;
+        }
+
+        let mut hay = String::new();
+        if block.children.is_empty() {
+            if let Some(t) = &block.text {
+                push_line(&mut hay, t);
+            }
+            if let Some(v) = block.attrs.iter().find(|a| a.name == "value") {
+                push_line(&mut hay, &v.value);
+            }
+        } else {
+            collect_block_text(block, &mut hay);
+        }
+
+        for (i, line) in hay.lines().enumerate() {
+            let probe = if opts.ignore_case {
+                line.to_lowercase()
+            } else {
+                line.to_string()
+            };
+            if probe.contains(needle) {
+                matches.push(GrepMatch {
+                    block_id: block.id.clone(),
+                    line: i + 1,
+                    snippet: truncate_ellipsis(line.trim(), 120),
+                    writable,
+                });
+                if opts.limit.is_some_and(|l| matches.len() >= l) {
+                    break;
+                }
+            }
+        }
+    }
+    matches
+}
+
+/// Append every descendant node's text (and drawio `value` label) to `out`, one
+/// per line, in document order.
+fn collect_block_text(node: &DocNode, out: &mut String) {
+    for c in &node.children {
+        if let Some(t) = &c.text {
+            push_line(out, t);
+        }
+        if let Some(v) = c.attrs.iter().find(|a| a.name == "value") {
+            push_line(out, &v.value);
+        }
+        collect_block_text(c, out);
+    }
+}
+
+/// Append `s` as a new line to `out`, skipping empties.
+fn push_line(out: &mut String, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(s);
 }
 
 /// Grep an xlsx workbook: match sheet-name blocks directly, then hydrate each
@@ -936,53 +1017,6 @@ fn grep_xlsx(
                 }
             }
             _ => {}
-        }
-    }
-
-    Ok(matches)
-}
-
-/// Grep a pptx deck: search each slide's full paragraph text (carried as the
-/// slide block's children) and attribute every hit to the slide's block id, the
-/// id `read` accepts. The synthetic "Slide N:" preview is not searched so the
-/// literal word "slide" doesn't spuriously match every slide.
-fn grep_pptx(
-    bytes: &[u8],
-    needle: &str,
-    opts: &GrepOptions,
-    writable: bool,
-) -> Result<Vec<GrepMatch>> {
-    let result = handlers::optimized::scan_pptx(bytes)?;
-    let mut matches = Vec::new();
-
-    for slide in &result.structure {
-        if opts.limit.is_some_and(|l| matches.len() >= l) {
-            return Ok(matches);
-        }
-        // Join the slide's paragraphs so line numbers track paragraph order.
-        let full = slide
-            .children
-            .iter()
-            .filter_map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        for (i, line) in full.lines().enumerate() {
-            let hay = if opts.ignore_case {
-                line.to_lowercase()
-            } else {
-                line.to_string()
-            };
-            if hay.contains(needle) {
-                matches.push(GrepMatch {
-                    block_id: slide.id.clone(),
-                    line: i + 1,
-                    snippet: truncate_ellipsis(line.trim(), 120),
-                    writable,
-                });
-                if opts.limit.is_some_and(|l| matches.len() >= l) {
-                    return Ok(matches);
-                }
-            }
         }
     }
 

@@ -75,6 +75,15 @@ for m in &matches {
   truncated scan preview — including runs that carry attributes
   (`<a:t xml:space="preserve">`) and entity-encoded text. Hits are attributed to
   the slide block (`slide[n]`), which `read` hydrates to the slide's paragraphs.
+- **Full-content reach beyond the preview.** For every format with a dedicated
+  optimized scan — csv, markdown, html, mermaid, drawio, pptx, pdf, svg — `grep`
+  searches the block's *full* hydrated content, not the truncated preview the
+  scan manifest shows. So it finds a value in any CSV row (not just the first
+  row of a chunk), section/paragraph text past the preview cutoff, deep diagram
+  statements, and drawio cell labels (stored in the `value` attribute). Each hit
+  is attributed to the scan-emitted block id (`rows[a-b]`, `section[n]`,
+  `paragraph[n]`, `body[n]`/`subgraph:<name>`, `diagram:<name>`, …), which `read`
+  hydrates to the full block.
 
 ## Typical loop
 

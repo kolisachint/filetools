@@ -225,7 +225,9 @@ pub fn scan_drawio(bytes: &[u8]) -> Result<OptimizedScanResult> {
             let mut cell_count = 0;
             count_nodes(&node.children, &mut cell_count, &mut total_tokens);
 
-            // Create diagram-level block
+            // Create diagram-level block, keeping the cells as children so
+            // grep/read reach cell labels (drawio stores labels in the `value`
+            // attribute, not element text).
             structure.push(DocNode {
                 id: format!("diagram:{}", diagram_name),
                 tag: "_diagram_block".to_string(),
@@ -240,7 +242,7 @@ pub fn scan_drawio(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     },
                 ],
                 text: Some(format!("Diagram ({} cells)", cell_count)),
-                children: Vec::new(), // Content loaded on demand
+                children: node.children.clone(),
             });
 
             block_count += 1;
@@ -302,7 +304,11 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
                         value: current_section.clone(),
                     }],
                     text: Some(section_preview),
-                    children: Vec::new(), // Content loaded on demand
+                    children: markdown_section_children(
+                        section_num,
+                        &current_section,
+                        &current_content,
+                    ),
                 });
 
                 block_count += 1;
@@ -323,6 +329,7 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
     if !current_section.is_empty() || !current_content.is_empty() {
         let preview = preview_text(&current_content.join(" "));
 
+        let children = markdown_section_children(section_num, &current_section, &current_content);
         structure.push(DocNode {
             id: format!("section[{}]", section_num),
             tag: "_section".to_string(),
@@ -331,7 +338,7 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 value: current_section,
             }],
             text: Some(preview),
-            children: Vec::new(),
+            children,
         });
 
         block_count += 1;
@@ -359,6 +366,32 @@ pub fn scan_markdown(bytes: &[u8]) -> Result<OptimizedScanResult> {
         block_count,
         total_tokens,
     })
+}
+
+/// Build the hydrated children of a markdown section: the heading (if any) plus
+/// every body line, each as its own text node, so grep/read reach the whole
+/// section rather than only its truncated preview.
+fn markdown_section_children(section_num: usize, heading: &str, body: &[String]) -> Vec<DocNode> {
+    let mut children = Vec::new();
+    if !heading.is_empty() {
+        children.push(DocNode {
+            id: format!("section[{section_num}].heading"),
+            tag: "_md_heading".to_string(),
+            attrs: Vec::new(),
+            text: Some(heading.to_string()),
+            children: Vec::new(),
+        });
+    }
+    for (i, line) in body.iter().enumerate() {
+        children.push(DocNode {
+            id: format!("section[{section_num}].line[{i}]"),
+            tag: "_md_line".to_string(),
+            attrs: Vec::new(),
+            text: Some(line.clone()),
+            children: Vec::new(),
+        });
+    }
+    children
 }
 
 /// Scan binary format (JPG, PNG) with metadata blocks.
@@ -490,6 +523,19 @@ pub fn scan_mermaid(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 Some(n) => format!("subgraph:{n}"),
                 None => format!("body[{idx}]"),
             };
+            // Carry every statement as a child so grep/read reach statements
+            // past the preview cutoff.
+            let children = lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| DocNode {
+                    id: format!("{id}.stmt[{i}]"),
+                    tag: "_mermaid_stmt".to_string(),
+                    attrs: Vec::new(),
+                    text: Some(line.clone()),
+                    children: Vec::new(),
+                })
+                .collect();
             structure.push(DocNode {
                 id,
                 tag: "_mermaid_group".to_string(),
@@ -498,7 +544,7 @@ pub fn scan_mermaid(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     value: lines.len().to_string(),
                 }],
                 text: Some(preview),
-                children: Vec::new(),
+                children,
             });
             *idx += 1;
         };
@@ -579,6 +625,19 @@ pub fn scan_csv(bytes: &[u8]) -> Result<OptimizedScanResult> {
             .get(start)
             .map(|r| preview_text(r))
             .unwrap_or_default();
+        // Carry every row in the range as a child so grep/read reach the whole
+        // chunk, not just its first row.
+        let children = data_rows[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| DocNode {
+                id: format!("rows[{}-{}].r[{}]", start, end - 1, start + i),
+                tag: "_csv_row".to_string(),
+                attrs: Vec::new(),
+                text: Some(line.to_string()),
+                children: Vec::new(),
+            })
+            .collect();
         structure.push(DocNode {
             id: format!("rows[{}-{}]", start, end - 1),
             tag: "_csv_rows".to_string(),
@@ -587,7 +646,7 @@ pub fn scan_csv(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 value: (end - start).to_string(),
             }],
             text: Some(format!("Rows {}-{}: {}", start, end - 1, preview)),
-            children: Vec::new(),
+            children,
         });
         start = end;
     }
@@ -660,6 +719,20 @@ pub fn scan_html(bytes: &[u8]) -> Result<OptimizedScanResult> {
                 id if id.starts_with("section") => "_html_section",
                 _ => "_html_paragraph",
             };
+            let full = strip_html(&el.text);
+            // Keep the truncated preview as the block's own text, but carry the
+            // full text as a child so grep/read reach content past the preview.
+            let children = if full.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![DocNode {
+                    id: format!("{}.text", el.id),
+                    tag: "_html_text".to_string(),
+                    attrs: Vec::new(),
+                    text: Some(full.clone()),
+                    children: Vec::new(),
+                }]
+            };
             DocNode {
                 id: el.id,
                 tag: tag.to_string(),
@@ -667,8 +740,8 @@ pub fn scan_html(bytes: &[u8]) -> Result<OptimizedScanResult> {
                     name: "level".to_string(),
                     value: el.tag,
                 }],
-                text: Some(preview_text(&strip_html(&el.text))),
-                children: Vec::new(),
+                text: Some(preview_text(&full)),
+                children,
             }
         })
         .collect();
